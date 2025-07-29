@@ -1,0 +1,73 @@
+#pragma kernel InputBufferData
+#pragma kernel InputBufferColorData
+#pragma kernel InputBufferDepthData
+#pragma kernel HZBMipGenerate
+Texture2D<float> _Depth;
+Texture2D<float4> _InputColor;
+RWTexture2D<float4> _Color;
+
+Texture2D<float2> _Src;
+RWTexture2D<float2> _Dst;
+int _MipLevel;
+int _DownLevel;
+uint2 _OriginSize;
+
+float4 _ZBufferParamsL;
+inline float LinearEyeDepthL(float z)
+{
+    float nearClip = _ZBufferParamsL.x;
+    float farClip = _ZBufferParamsL.y;
+    
+    return nearClip * farClip / (nearClip + (farClip - nearClip) * z);
+}
+
+
+[numthreads(8, 8, 1)]
+void InputBufferData(uint3 id : SV_DispatchThreadID)
+{
+    uint scale = 1u << _DownLevel;
+    uint2 srcPix = id.xy * scale;
+    srcPix = min(srcPix, _OriginSize - 1);
+
+    float3 inCol = _InputColor.Load(int3(srcPix, 0));
+    _Color[id.xy] = float4(inCol, 1.0);
+
+    float depth = LinearEyeDepthL(_Depth.Load(int3(srcPix, 0)));
+    _Dst[id.xy] = float2(depth, depth);
+}
+[numthreads(8, 8, 1)]
+void InputBufferColorData(uint3 id : SV_DispatchThreadID)
+{
+    uint scale = 1u << _DownLevel;
+    uint2 srcPix = id.xy * scale;
+    srcPix = min(srcPix, _OriginSize - 1);
+
+    float3 inCol = _InputColor.Load(int3(srcPix, 0));
+    _Color[id.xy] = float4(inCol, 1.0);
+}
+[numthreads(8, 8, 1)]
+void InputBufferDepthData(uint3 id : SV_DispatchThreadID)
+{
+    uint scale = 1u << _DownLevel;
+    uint2 srcPix = id.xy * scale;
+    srcPix = min(srcPix, _OriginSize - 1);
+
+    float depth = LinearEyeDepthL(_Depth.Load(int3(srcPix, 0)));
+    _Dst[id.xy] = float2(depth, depth);
+}
+[numthreads(8, 8, 1)]
+void HZBMipGenerate(uint3 id : SV_DispatchThreadID)
+{
+    uint2 dstPix = id.xy;
+    uint2 srcPix0 = dstPix * 2;
+    uint2 srcPix1 = srcPix0 + uint2(1, 0);
+    uint2 srcPix2 = srcPix0 + uint2(0, 1);
+    uint2 srcPix3 = srcPix0 + uint2(1, 1);
+
+    float2 d0 = _Src.Load(int3(srcPix0, _MipLevel));
+    float2 d1 = _Src.Load(int3(srcPix1, _MipLevel));
+    float2 d2 = _Src.Load(int3(srcPix2, _MipLevel));
+    float2 d3 = _Src.Load(int3(srcPix3, _MipLevel));
+
+    _Dst[dstPix] = float2(min(min(d0.x, d1.x), min(d2.x, d3.x)), max(max(d0.y, d1.y), max(d2.y, d3.y)));
+}

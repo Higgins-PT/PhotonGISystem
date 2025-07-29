@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: ae28741cc69fafa4d87c82c131954784
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - photonRendererCS: {fileID: 7200000, guid: 7c1f7c5dd0e2c9d48a6cdcffe3ce3db3, type: 3}
+  - debugCS: {fileID: 7200000, guid: d05e8ec6404c2c347ba3d1bb701455f8, type: 3}
+  - debugPlane: {instanceID: 0}
+  - albedoRTImage: {instanceID: 0}
+  - normalRTImage: {instanceID: 0}
+  - emissiveRTImage: {instanceID: 0}
+  - depthRTImage: {instanceID: 0}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

@@ -1,0 +1,25 @@
+// Copy3D.compute
+
+#pragma kernel CSMain
+#pragma kernel ClipTex
+RWTexture3D<float4> _Source;
+RWTexture3D<float4> _Destination;
+
+[numthreads(8, 8, 8)]
+void CSMain(uint3 threadID : SV_DispatchThreadID)
+{
+
+    float4 color = _Source[threadID];
+    _Destination[threadID] = color;
+}
+int _Depth;
+RWTexture3D<half> _SDFShape;
+RWTexture2D<half> _ClipResult;
+
+[numthreads(8, 8, 1)]
+void ClipTex(uint3 id : SV_DispatchThreadID)
+{
+    _ClipResult[id.xy] = _SDFShape[uint3(id.xy, _Depth)];
+
+
+}

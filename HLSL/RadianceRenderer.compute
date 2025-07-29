@@ -1,0 +1,1824 @@
+﻿#pragma kernel SparseLightProbesLevelInit//ActiveRT
+#pragma kernel SparseLightProbesLevelHZB//ActiveRT
+#pragma kernel SparseLightProbesLevelFini//ActiveRT
+#pragma kernel SparseLightProbesLevelDebug//ActiveRT
+#pragma kernel RadianceCascadesInit//ActiveRT
+#pragma kernel LocalSDFDiffuse//ActiveRT
+#pragma kernel GlobalVoxelDiffuse//ActiveRT
+#pragma kernel LocalSDFDirectLightSample//ActiveRT
+#pragma kernel LightProbeSHGet//Cascades
+#pragma kernel TemporalReuse//Cascades
+#pragma kernel SpatialReuse//Cascades
+
+#pragma kernel HistoryFeedBack
+#pragma kernel DLTemporalReuse//ActiveRT
+#pragma kernel DLSpatialReuse//ActiveRT
+#pragma kernel OutputLum//ActiveRT
+#pragma kernel OutputColor//ActiveRT
+#pragma kernel ReservoirInput//Cascades
+#pragma kernel ReservoirInputDL//ActiveRT
+#pragma kernel DirectLight//ActiveRT
+#pragma kernel SpecularSSR//ActiveRT
+#pragma kernel SpecularLS//ActiveRT
+#pragma kernel SpecularGV//ActiveRT
+#pragma kernel SpecularRoughMix//ActiveRT
+
+#pragma kernel ExtendRT
+#pragma kernel ExtendIDRT
+#pragma kernel ExtendSPRT
+#pragma kernel FillDLBuffer
+#pragma kernel CullLights
+
+#pragma kernel SampleGlobalProbes
+
+#pragma target 5.1
+#pragma require logicOp
+#include "DirectLight.hlsl"
+#include "RayTrace.hlsl"
+#include "SSR.hlsl"
+
+struct RaySample
+{
+    float3 radiance;
+    float pdf;
+    float3 pos;
+    float3 path;
+    float3 endNormal;
+    int hit;
+};
+struct ReservoirSample
+{
+    RaySample selected;
+    float weightSum;
+    float eWeight;
+    uint count;
+    
+};
+
+struct LightSample
+{
+    float3 Le; // Incoming radiance from the chosen light.
+    float pdf; // Probability density of selecting this sample.
+    float3 L; // Normalized direction toward the light.
+    float dist; // Distance to the light center.
+    uint index; // Index of the light in the global buffer.
+};
+
+struct ReservoirLightSample
+{
+    LightSample selected;
+    float weightSum;
+    uint count;
+    
+};
+#define LIGHT_POINT 0u  
+#define LIGHT_SPOT  1u
+#define LIGHT_RECT  2u  
+#define LIGHT_DISC  3u  
+#define DefaultMetallic 0
+#define DefaultRoughness 1
+Texture2D<float4> _NoiseTex;
+
+RWStructuredBuffer<ReservoirSample> _ReservoirBuffer;
+RWStructuredBuffer<ReservoirSample> _HistoryBuffer;
+RWStructuredBuffer<ReservoirSample> _TemporalReservoir;
+
+RWStructuredBuffer<ReservoirLightSample> _DLReservoirBuffer;
+RWStructuredBuffer<ReservoirLightSample> _DLHistoryBuffer;
+RWStructuredBuffer<ReservoirLightSample> _DLTemporalReservoir;
+TextureCube<float4> _CubeMap;
+SamplerState _CubeMapSampler;
+Texture2D<float4> _DepthTexture;
+Texture2D<float4> _NormalTexture;
+Texture2D<float4> _ActiveTexture;
+RWTexture2D<float4> _ResultTarget;
+RWTexture2D<float4> _RadianceResult;//float4(color.xyz,pow)
+RWTexture2D<float4> _RadianceCascadesRT;
+RWTexture2D<float4> _GBufferEmissionRT;
+RWTexture2D<float4> _GBufferMetallicRT;
+RWTexture2D<float4> _CascadesDirectionRT;
+RWTexture2D<float4> _SpecularRT;
+RWTexture2D<float4> _SpecularRoughRT;
+RWTexture2D<float4> _DirectLightRT;
+RWTexture2D<float> _TemporalDLDistRT;
+RWTexture2D<half> _BlendMaskRT;
+RWTexture2D<float> _SparseLightLevel;
+Texture2D<float2> _MotionVectorRT;
+Texture2D<float> _ShadowRT;
+Texture2D<float4> _LumResult;
+
+Texture2D<float4> _DirectLight;
+Texture2D<float4> _Specular;
+
+Texture2D<float4> _OriginRT;
+RWTexture2D<float4> _ExtendOriginRT;
+SamplerState sampler_OriginRT;
+
+SamplerState sampler_DirectLight;
+SamplerState sampler_LumResult;
+SamplerState sampler_Specular;
+
+float _NoiseSize_X;
+float _NoiseSize_Y;
+int _SPP;
+int _MaxBounces;
+int _CascadeStride;
+int _CascadeStrideHalf;
+int _CascadeStrideSquare;
+int2 _RadianceCascadesRTSize;
+int _ScreenWidth;
+int _ScreenHeight;
+float2 _MapScale;
+int2 _ActiveRTSize;
+uint _HistoryCount;
+int _MinResolutionLevel;
+int _MaxResolutionLevel;
+float _WorldProbeEnableDistance;
+float _ProbeLerpRange;
+float2 _DownResolution;
+float _ResolutionScale;
+float _ResolutionScaleInv;
+float _EmissionIntensity;
+
+float2 _SpecularDownResolution;
+float _SpecularResolutionScale;
+float _SpecularResolutionScaleInv;
+float _IndirectResolutionScale;
+float _IndirectResolutionScaleInv;
+float2 _IndirectDownResolution;
+float _NoiseIntensity;
+float _LocalSDFGetIlluminationIntensity;
+//-------------------------Light-----------------------
+float3 _LightDirection;
+float3 _LightColor;
+float _LocalSDFStartOffest;
+float _IndirectIlluminationIntensity;
+
+//-------------------------Probe-----------------------
+RWTexture3D<float4> _SHBufferRW;
+int _SampleCount;
+
+int _FeedBackResolution;
+
+//-------------------------ReSTIR----------------------
+uint GetHistoryBufferIndex(int2 index, int time)
+{
+    return index.x + index.y * _RadianceCascadesRTSize.x + time * _RadianceCascadesRTSize.x * _RadianceCascadesRTSize.y;
+
+}
+uint GetBufferIndex(int2 index)
+{
+    return index.x + index.y * _RadianceCascadesRTSize.x;
+
+}
+float3 GetReservoirResult(ReservoirSample rs)
+{
+    return rs.selected.radiance * (rs.eWeight);
+}
+inline ReservoirSample EmptyRS()
+{
+    ReservoirSample result;
+    result.count = 0;
+    result.weightSum = 0;
+    result.eWeight = 0;
+    result.selected.pos = float3(0, 0, 0);
+    result.selected.pdf = 0;
+    result.selected.radiance = float3(0, 0, 0);
+    result.selected.path = float3(0, 0, 0);
+    result.selected.endNormal = float3(0, 0, 0);
+    result.selected.hit = 0;
+    return result;
+
+}
+float ComputeLuminance(float3 color)
+{
+    float3 luminanceCoeff = float3(0.2126, 0.7152, 0.0722);
+    float luminance = dot(color, luminanceCoeff);
+    return luminance;
+}
+void MergeReservoir(inout ReservoirSample sourceRS, ReservoirSample otherRS, float4 seed)
+{
+    float random = saturate(FastHash(seed));
+    float w = sourceRS.weightSum;
+    float newW = otherRS.weightSum;
+    if ((w + newW) == 0)
+    {
+        sourceRS.count += otherRS.count;
+        sourceRS.weightSum = 0;
+    }
+    else
+    {
+        float p = newW / (w + newW);
+        if (random <= p)
+        {
+            sourceRS.selected = otherRS.selected;
+        
+        }
+        sourceRS.count += otherRS.count;
+        sourceRS.weightSum = w + newW;
+    }
+
+}
+void UpdateReservoir(inout ReservoirSample sourceRS, RaySample newSample, float4 seed)
+{
+    float random = saturate(FastHash(seed));
+    float w = sourceRS.weightSum;
+    float newW = ComputeLuminance(newSample.radiance);
+    if ((w + newW) == 0)
+    {
+        sourceRS.selected = newSample;
+        sourceRS.count++;
+        sourceRS.weightSum = 0;
+    }
+    else
+    {
+        float p = newW / (w + newW);
+        if (random <= p)
+        {
+            sourceRS.selected = newSample;
+        
+        }
+        sourceRS.count++;
+        sourceRS.weightSum = w + newW;
+    }
+
+}
+
+float EvaluateTargetPDF(RaySample sample, float3 pos, float3 normal, float4 metallic)
+{
+    return EvaluateBRDFPdf(normal, normalize(pos - sample.pos), normalize(sample.path), clamp(ComputeLuminance(metallic.xyz), 0, 0.95), clamp(1 - metallic.w, 0.05, 1));
+}
+
+
+void StoreSH(int2 uv, L2_RGB sh)
+{
+    [unroll]
+    for (uint i = 0; i < L2_RGB::NumCoefficients; ++i)
+    {
+        _SHBufferRW[int3(uv, i)] = float4(sh.C[i], 0.0f);
+    }
+}
+
+L2_RGB LoadSH(int2 uv)
+{
+    L2_RGB sh = L2_RGB::Zero();
+    [unroll]
+    for (uint i = 0; i < L2_RGB::NumCoefficients; ++i)
+    {
+        float4 v = _SHBufferRW[int3(uv, i)];
+        sh.C[i] = v.xyz;
+    }
+    return sh;
+}
+inline LightSample MakeMissSample()
+{
+    LightSample s;
+    s.Le = 0;
+    s.pdf = 1;
+    s.L = 0;
+    s.dist = 1.0; 
+    s.index = 0xffffffff;
+    return s;
+}
+
+uint GetType(uint flags)
+{
+    return flags & 3u;
+}
+#define DISC_SEGMENTS 16 
+float TriangleSolidAngle(float3 a, float3 b, float3 c)
+{
+    float la = length(a);
+    float lb = length(b);
+    float lc = length(c);
+    float denom = la * lb * lc + dot(a, b) * lc + dot(b, c) * la + dot(c, a) * lb;
+    float numer = dot(a, cross(b, c));
+    return 2.0 * atan2(numer, denom);
+}
+inline float2 GetNoise(int2 index)
+{
+    float2 noise = _NoiseTex[index.xy % int2(_NoiseSize_X, _NoiseSize_Y)].xy;
+    return noise;
+}
+
+
+    float3 EvaluateDiscLight
+(
+    in LightBufferData L, float3 P, float3 N
+)
+{
+    float3 toP = L.positionWS - P;
+    if (dot(toP, L.directionWS) >= 0.0)
+        return 0.0;
+
+    float3 vx = normalize(L.rightWS);
+    float3 vy = normalize(cross(L.directionWS, vx)); 
+    float3 C = L.positionWS;
+    const float R = L.areaSize.x;
+
+    float omega = 0.0;
+    float3 prev = C + vx * R;
+    prev -= P; 
+
+    [unroll]
+    for (int i = 1; i <= DISC_SEGMENTS; ++i)
+    {
+        float theta = (i / (float) DISC_SEGMENTS) * 6.283185307;
+        float2 sc = float2(cos(theta), sin(theta));
+        float3 curr = C + (vx * sc.x + vy * sc.y) * R - P;
+
+        omega += TriangleSolidAngle(prev, curr, C - P);
+        prev = curr;
+    }
+
+    float3 E = L.radiance * abs(max(0.0, dot(N, normalize(toP))) * omega);
+
+    float distSqr = dot(C - P, C - P);
+    float dist = sqrt(distSqr);
+    if (L.invRange > 0.0)
+
+        E *= saturate(1.0 - dist * L.invRange);
+    return E;
+}
+
+float3 EvaluateRectLight
+(
+    in LightBufferData L,
+    float3 P, float3 N
+)
+{
+    float3 Rx = normalize(L.rightWS); 
+    float3 Ry = normalize(cross(L.directionWS, Rx)); 
+    float hx = L.areaSize.x;
+    float hy = L.areaSize.y;
+
+    float3 C = L.positionWS;
+    float3 v00 = (C - Rx * hx - Ry * hy) - P;
+    float3 v10 = (C + Rx * hx - Ry * hy) - P;
+    float3 v11 = (C + Rx * hx + Ry * hy) - P;
+    float3 v01 = (C - Rx * hx + Ry * hy) - P;
+
+    float omega = TriangleSolidAngle(v00, v10, v11) +
+                  TriangleSolidAngle(v00, v11, v01); 
+    float3 dir = L.positionWS - P;
+    float distSqr = dot(dir, dir);
+    dir = normalize(dir);
+    float Lum = max(0.0, dot(N, dir)) * omega;
+    float dist = sqrt(distSqr);
+
+    if (L.invRange > 0.0)
+        Lum *= saturate(1.0 - dist * L.invRange);
+    Lum *= saturate(sign(dot(-dir, L.directionWS)));
+    float3 E = L.radiance * abs(Lum);
+    return E;
+}
+LightSample SampleSceneLights(float3 posWS, float3 nWS, LightBufferData Ldat, int index, int2 uv)
+{
+    LightSample s;
+    s.Le = 0;
+    s.pdf = 1;
+    s.L = 0;
+    s.dist = 1;
+    s.index = index;
+    
+    float3 dir = Ldat.positionWS - posWS;
+    float distSqr = dot(dir, dir);
+    s.dist = sqrt(distSqr);
+    s.L = dir * rsqrt(distSqr);
+
+    float att = 1.0;
+    if (Ldat.invRange > 0.0)
+    {
+        att = saturate(1.0 - distSqr * Ldat.invRange * Ldat.invRange);
+    }
+
+
+
+    uint lightType = GetType(Ldat.flags);
+    float pDir = 1;
+    float4 gMetallic = _GBufferMetallicRT[uv];
+    float metallic = ComputeLuminance(gMetallic.xyz);
+    float smoothness = gMetallic.w;
+    float3 V = normalize(posWS - _CameraPosition);
+    float cosNL = saturate(dot(nWS, s.L));
+    //float3 cosNL = CookTorranceBRDF(nWS, V, s.L, Ldat.radiance, metallic, clamp(1 - smoothness, 0, 0.999));
+    if (lightType == LIGHT_POINT)
+    {
+        s.Le = cosNL * att * Ldat.radiance;
+
+    }
+    if (lightType == LIGHT_SPOT)
+    {
+        float cosTheta = dot(-s.L, Ldat.directionWS);
+        float smooth = saturate(
+            (cosTheta - Ldat.spotCosOuter) /
+            max(1e-4, Ldat.spotCosInner - Ldat.spotCosOuter));
+        att *= smooth;
+        s.Le = cosNL * att * Ldat.radiance;
+
+    }
+    if (lightType == LIGHT_RECT)
+    {
+        s.Le = EvaluateRectLight(Ldat, posWS, nWS);
+
+    }
+    else if (lightType == LIGHT_DISC)
+    {
+        s.Le = EvaluateDiscLight(Ldat, posWS, nWS);
+
+    }
+
+
+
+
+    s.pdf = pDir / GetSceneLightCount();
+
+    return s;
+}
+
+LightSample SampleSceneLightsRandom(float3 posWS, float3 nWS, float rand, int2 uv)
+{
+
+    LightSample s = MakeMissSample();
+    uint sceneLC = GetSceneLightCount();
+    if (sceneLC == 0)
+        return s;
+
+    uint idx = clamp((uint) floor(rand * (float) sceneLC), 0u, sceneLC - 1u);
+    s.index = idx;
+
+    LightBufferData Ldat = _LightsBuffer[idx];
+
+    return SampleSceneLights(posWS, nWS, Ldat, idx, uv);
+
+}
+
+
+void AddSampleToReservoir(inout ReservoirLightSample res, in LightSample candidate, float candidateWeight, float4 rngState)
+{
+    res.count += 1;
+    res.weightSum += candidateWeight;
+    if (res.count == 1)
+    {
+        res.selected = candidate;
+    }
+    else if (candidateWeight > 0)
+    {
+        float r = FastHash(rngState);
+        if (r * res.weightSum < candidateWeight)
+        {
+            res.selected = candidate;
+        }
+    }
+}
+ReservoirLightSample MergeReservoirs(ReservoirLightSample A, ReservoirLightSample B, float4 rngState)
+{
+    ReservoirLightSample merged;
+    merged.count = A.count + B.count;
+    merged.weightSum = A.weightSum + B.weightSum;
+    merged.selected = A.selected;
+    if (merged.weightSum <= 0)
+    {
+        merged.selected = A.selected;
+        return merged;
+    }
+    float r = FastHash(rngState) * merged.weightSum;
+    if (r < A.weightSum)
+    {
+        merged.selected = A.selected;
+    }
+    else
+    {
+        merged.selected = B.selected;
+    }
+    
+    return merged;
+}
+void GetGBuffer(int2 index, inout float3 pos, inout float depth, inout float3 normal, float2 jitter)
+{
+    depth = LinearEyeDepth(_DepthTexture[index].x);
+    pos = UVToWorld(((float2) index + jitter) / (float2) _ActiveRTSize, depth);
+    normal = _NormalTexture[index].xyz;
+}
+void GetGBuffer(int2 index, inout float3 pos, inout float depth, inout float3 normal, inout float4 metallic)
+{
+    depth = LinearEyeDepth(_DepthTexture[index].x);
+    pos = UVToWorld((float2) index / (float2) _ActiveRTSize, depth);
+    normal = _NormalTexture[index].xyz;
+    metallic = _GBufferMetallicRT[index];
+    metallic.w = clamp(metallic.w, 0, 0.7);
+
+
+}
+void GetGBuffer(int2 index, inout float3 pos, inout float depth, inout float3 normal)
+{
+    depth = LinearEyeDepth(_DepthTexture[index].x);
+    pos = UVToWorld((float2) index / (float2) _ActiveRTSize, depth);
+    normal = _NormalTexture[index].xyz;
+}
+void GetGBuffer(int2 index, inout float3 pos, inout float3 normal)
+{
+    float depth = LinearEyeDepth(_DepthTexture[index].x);
+    pos = UVToWorld((float2) index / (float2) _ActiveRTSize, depth);
+    normal = _NormalTexture[index].xyz;
+}
+void GetGBuffer(int2 index, inout float3 pos)
+{
+    float depth = LinearEyeDepth(_DepthTexture[index].x);
+    pos = UVToWorld((float2) index / (float2) _ActiveRTSize, depth);
+}
+uint Get1DIndex(uint2 coord, uint width)
+{
+    return coord.y * width + coord.x;
+}
+
+float2 Rand2(uint seed)
+{
+    return float2(Rand(seed), Rand(seed));
+}
+float RandF2(float2 seed)
+{
+    return frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
+}
+float GaussianRand(float sigma, float min, float max, float2 seed)
+{
+    float u = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
+    float v = frac(sin(dot(seed, float2(93.9898, 67.345))) * 43758.5453);
+    return clamp(sigma * sqrt(-2.0 * log(u)) * cos(6.28318 * v) + (min + max) * 0.5, min, max);
+}
+
+float2 SampleNormalDistribution2D(inout uint seed)
+{
+    float2 r = Rand2(seed);
+    float radius = sqrt(-2.0 * log(r.x));
+    float theta = 2.0 * 3.14159265359 * r.y;
+
+    float x = radius * cos(theta);
+    float y = radius * sin(theta);
+    return float2(x, y);
+}
+inline float GaussianRandomFloat3ToFloat(float3 seed)
+{
+    seed = frac(seed * float3(12.9898, 78.233, 37.719));
+    float u1 = frac(sin(dot(seed, float3(1.0, 57.0, 113.0))) * 43758.5453);
+    float u2 = frac(sin(dot(seed, float3(31.0, 97.0, 23.0))) * 43758.5453);
+
+    float r = sqrt(-2.0 * log(u1));
+    float theta = 6.28318530718 * u2;
+    float gaussianRandom = r * cos(theta);
+
+    return saturate(gaussianRandom);
+}
+inline float GaussianRandomFloat4ToFloat(float4 seed)
+{
+    seed = frac(seed * float4(12.9898, 78.233, 37.719, 55.543));
+    float u1 = frac(sin(dot(seed, float4(1.0, 57.0, 113.0, 31.0))) * 43758.5453);
+    float u2 = frac(sin(dot(seed, float4(31.0, 97.0, 23.0, 71.0))) * 43758.5453);
+    float r = sqrt(-2.0 * log(u1 + 1e-8)); 
+    float theta = 6.28318530718 * u2;
+    float gaussianRandom = r * cos(theta);
+    return saturate(gaussianRandom);
+}
+
+float3 SampleNormalDistribution3D(float stdDev, inout uint seed)
+{
+    float2 nxy = SampleNormalDistribution2D(seed);
+    float2 nz = SampleNormalDistribution2D(seed);
+    float3 normal3D = float3(nxy.x, nxy.y, nz.x);
+    return normal3D * stdDev;
+}
+float3 SampleSemicircleCosineLobe(float2 seed, float weight, float3 direction)
+{
+    float u = RandF2(seed);
+    float v = RandF2(seed.yx + float2(1.0, 1.0));
+
+    float cosTheta = pow(1.0 - u, 1.0 / (weight + 1.0));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    float theta = acos(cosTheta); 
+    
+
+    float phi = 2.0 * 3.14159265 * v;
+    
+    float3 sampleLocal = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+    
+    float3 N = normalize(direction);
+    float3 up = abs(N.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+    float3 T = normalize(cross(up, N));
+    float3 B = cross(N, T);
+    
+    return sampleLocal.x * T + sampleLocal.y * B + sampleLocal.z * N;
+}
+float Radians(float degrees)
+{
+    return degrees * (PI / 180.0);
+}
+
+float3 SampleConeDirection(float3 normal, float coneAngle, inout uint seed)
+{
+    float2 randVal = NextRand(seed);
+
+    float angleRad = Radians(coneAngle);
+    float cosMax = cos(angleRad);
+
+
+    float cosTheta = lerp(1.0, cosMax, randVal.x);
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+    float phi = 2.0 * PI * randVal.y;
+
+    float3 w = normalize(normal);
+
+    float3 up = (abs(w.z) < 0.999f) ? float3(0, 0, 1) : float3(0, 1, 0);
+
+    float3 u = normalize(cross(up, w));
+    float3 v = cross(w, u);
+
+
+    float3 dir = u * (cos(phi) * sinTheta)
+               + v * (sin(phi) * sinTheta)
+               + w * cosTheta;
+
+    return normalize(dir);
+}
+int2 GetCascadesCenterIndex(int2 index)
+{
+    return (int2) floor((float2) index / (float) _CascadeStride) * _CascadeStride + int2(_CascadeStrideHalf, _CascadeStrideHalf);
+}
+int GetInCascadesIndex1D(int2 index)
+{
+    index = index % int2(_CascadeStride, _CascadeStride);
+
+    return index.x + index.y * _CascadeStride;
+}
+
+float GetSampleWeight(LightSample lightSample)
+{
+    
+    return ComputeLuminance(lightSample.Le) / lightSample.pdf;
+
+}
+float CosineWeightedHemispherePDF(float3 normal, float3 sampleDir)
+{
+    sampleDir = normalize(sampleDir);
+    float cosTheta = saturate(dot(normal, sampleDir));
+    return cosTheta / 3.14159265;
+}
+float ComputeThetaMax(float currentWeight)
+{
+    float maxTheta = 180;
+    return clamp(15 / max(currentWeight, 0.001), 0, maxTheta);
+}
+float3 LimitSemicircle(float3 semicircleNormal, float3 direction)
+{
+    float signD = sign(dot(direction, semicircleNormal));
+    return direction * signD;
+}
+struct RayTraceSample
+{
+    float3 direction;
+    float pdf;
+};
+
+uint2 GetCascadesIndex(uint2 index)
+{
+    float2 cellCoordFloat = (float2) (index) / (float) _CascadeStride;
+    int2 baseCell = (int2) floor(cellCoordFloat);
+    return baseCell;
+}
+inline uint GetReservoir1DIndex_Cascades(int2 index)
+{
+    int2 startIndex = index.xy * _CascadeStride;
+    int2 centerPixel = index.xy * _CascadeStride + int2(_CascadeStrideHalf, _CascadeStrideHalf);
+    centerPixel = clamp(centerPixel, int2(0, 0), _ActiveRTSize - int2(1, 1));
+    uint centerIndex1D = Get1DIndex(centerPixel, _ActiveRTSize.x);
+    return centerIndex1D;
+}
+void ReuseSpatialSamples(int2 index, float3 currentPos, float3 currentNorm,
+                         inout ReservoirLightSample res, uint rngState)
+{
+    static int2 offsets[8] = { int2(-1, -1), int2(1, -1), int2(0, -1), int2(-1, 0), int2(1, 0), int2(-1, 1), int2(1, 1), int2(0, 1) };
+    for (int i = 0; i < 8; ++i)
+    {
+        int2 neighIndex = index + offsets[i];
+        if (neighIndex.x < 0 || neighIndex.y < 0 ||
+            neighIndex.x >= _DownResolution.x || neighIndex.y >= _DownResolution.y)
+        {
+            continue;
+        }
+        uint2 fullNeighIndex = neighIndex;
+        int neighIndex1D = Get1DIndex(neighIndex, _DownResolution.x);
+        ReservoirLightSample neighRes = _DLReservoirBuffer[neighIndex1D];
+        LightSample neighSample = neighRes.selected;
+        float3 neighPos;
+        float3 neighNorm;
+        GetGBuffer(fullNeighIndex, neighPos, neighNorm);
+        bool normalClose = dot(currentNorm, neighNorm) > 0.9f;
+        bool positionClose = distance(currentPos, neighPos) < 0.5f;
+        if (!(normalClose && positionClose))
+        {
+            continue;
+        }
+        res = MergeReservoirs(res, neighRes, rngState);
+    }
+}
+void ReuseTemporalSample(in ReservoirLightSample prevRes,
+                         inout ReservoirLightSample mainRes, float3 hitP, float3 N, float4 rngState)
+{
+    LightSample prevSample = prevRes.selected;
+    uint prevM_original = prevRes.count;
+    prevRes.count = 1;
+    float scale = (float) prevRes.count / (float) prevM_original;
+    prevRes.weightSum *= scale * 0.99;
+    prevRes.selected.Le *= 0.99;
+    prevRes.weightSum = max(prevRes.weightSum, 0);
+    mainRes = MergeReservoirs(mainRes, prevRes, rngState);
+
+
+}
+
+RayTraceSample GetRandomCone(float3 semicircleNormal, float3 targetD, float currentWeight, float2 seed)
+{
+    float n = clamp(currentWeight, 0, 2) * 100;
+    RayTraceSample raySample;
+    raySample.direction = SampleSemicircleCosineLobe(seed, n, targetD);
+    float cosTheta = saturate(dot(normalize(targetD), normalize(raySample.direction)));
+    raySample.direction = LimitSemicircle(semicircleNormal, raySample.direction);
+    n = clamp(n, 0, 10);
+    raySample.pdf = (n + 1.0) * pow(cosTheta, n) / 6.28;
+    
+    return raySample;
+}
+//---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Ray GetSceneDir(int2 index)
+{
+    Ray ray = ScreenToRay((float2) index, float2((float) _ScreenWidth, (float) _ScreenHeight),
+                      _ProjectionMatrixInverse, _ViewMatrixInverse);
+    return ray;
+}
+[numthreads(8, 8, 1)]
+void SparseLightProbesLevelInit(uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (float2) id.xy / _ScreenSize_SSR * _ResolutionScaleInv;
+    float depth = GetHZBDepthFromScreenUVFar(uv, _MinResolutionLevel);
+    float logDepth = max(log10(depth), 0);
+    int level = _MinResolutionLevel;
+    for (int i = _MinResolutionLevel + 1; i <= _MaxResolutionLevel; i++)
+    {
+
+        float absDD = abs(logDepth - max(log10(GetHZBDepthFromScreenUVFar(uv, level)), 0));
+        if (absDD > 0.01)
+        {
+            break;
+        }
+        level = i;
+    }
+    _SparseLightLevel[id.xy] = (float)level;
+
+}
+Texture2D<float> _Src;
+RWTexture2D<float> _Dst;
+int _MipLevel;
+[numthreads(8, 8, 1)]
+void SparseLightProbesLevelHZB(uint3 id : SV_DispatchThreadID)
+{
+    uint2 dstPix = id.xy;
+    uint2 srcPix0 = dstPix * 2;
+    uint2 srcPix1 = srcPix0 + uint2(1, 0);
+    uint2 srcPix2 = srcPix0 + uint2(0, 1);
+    uint2 srcPix3 = srcPix0 + uint2(1, 1);
+
+    int d0 = (int) _Src.Load(int3(srcPix0, _MipLevel));
+    int d1 = (int) _Src.Load(int3(srcPix1, _MipLevel));
+    int d2 = (int) _Src.Load(int3(srcPix2, _MipLevel));
+    int d3 = (int) _Src.Load(int3(srcPix3, _MipLevel));
+
+    _Dst[dstPix] = float(min(min(d0.x, d1.x), min(d2.x, d3.x)));
+
+}
+static const float kEps = 1e-8;
+bool2 IsInteger2_Component(float2 x)
+{
+    return abs(frac(x)) < kEps; 
+}
+[numthreads(8, 8, 1)]
+void SparseLightProbesLevelFini(uint3 id : SV_DispatchThreadID)
+{
+
+    uint2 dstPix = id.xy;
+    int dstlevel = (int)_Src.Load(int3(dstPix, 0));
+    int resultLevel = _MinResolutionLevel;
+    for (int i = _MinResolutionLevel; i <= dstlevel; i++)
+    {
+        uint2 srcPix = (uint2)floor((float2) dstPix / exp2(i));
+        int src = (int)_Src.Load(int3(srcPix, i));
+        if (src < dstlevel)
+        {
+            break;
+        }
+        resultLevel = i;
+    }
+
+    _Dst[dstPix] = resultLevel;
+
+}
+[numthreads(8, 8, 1)]
+void SparseLightProbesLevelDebug(uint3 id : SV_DispatchThreadID)
+{
+
+    uint2 dstPix = id.xy;
+    int dstlevel = (int) _Src.Load(int3(dstPix, 0));
+    if (!all(IsInteger2_Component((float2) dstPix / exp2(dstlevel))))
+    {
+        _ResultTarget[dstPix] = 1;
+    }
+    else
+    {
+        _ResultTarget[dstPix] = 0;
+    }
+
+
+}
+inline int2 GetSparseLightProbesIndex(int2 index)
+{
+    int dstlevel = (int) _SparseLightLevel.Load(int3(index, 0));
+    return int2(floor((float2) index / exp2((float) dstlevel)) * exp2((float) dstlevel));
+
+}
+[numthreads(8, 8, 1)]
+void RadianceCascadesInit(uint3 id : SV_DispatchThreadID)
+{
+    uint index1D = Get1DIndex(id.xy, _DownResolution.x);
+
+    int2 cascadesIndex = GetCascadesCenterIndex(id.xy);
+    float depth;
+    float3 pos;
+    float3 startNormal;
+    int2 index = id.xy;
+    uint seed = id.x * id.y % 100;
+    float2 rand2 = _NoiseTex[int2(id.x % 256, id.y % 256)].xy;
+    float4 metallic;
+    GetGBuffer(id.xy * _IndirectResolutionScaleInv, pos, depth, startNormal, metallic);
+    
+    Ray ray = ScreenToRay((float2) index, float2(_RadianceCascadesRTSize), _ProjectionMatrixInverse, _ViewMatrixInverse);
+    float pdf = 0;
+    float3 f;
+    float3 direction;
+    SampleBRDF(startNormal, -ray.direction, float3(1, 1, 1), ComputeLuminance(metallic.xyz), 1 - metallic.w, FastHash(float4(seed * _TimeSeed, rand2, _TimeSeed)), FastHash(float4(_TimeSeed, rand2 * _TimeSeed, seed)), FastHash(float4(seed, rand2, _TimeSeed)), direction, f, pdf);
+    _CascadesDirectionRT[id.xy] = float4(direction, pdf);
+
+}
+
+
+[numthreads(GROUP_THREADS, 1, 1)]
+void LocalSDFDiffuse(uint3 id : SV_DispatchThreadID, uint3 gtID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+
+    PERSIST_PRE(gtID)
+    [loop]
+    while (true)
+    {
+        PERSIST_INIT(gtID)
+        PERSIST_POP(index)
+
+        float depth;
+        float3 pos;
+        float3 normal;
+        float4 metallic;
+        GetGBuffer(index * _IndirectResolutionScaleInv, pos, depth, normal, metallic);
+        
+        int2 cascadesIndex = GetCascadesCenterIndex(index);
+        float4 directionRT = _CascadesDirectionRT[index];
+        Ray screenRay = ScreenToRay((float2) index, float2(_RadianceCascadesRTSize), _ProjectionMatrixInverse, _ViewMatrixInverse);
+        Ray ray;
+        ray.origin = pos;
+        ray.direction = directionRT.xyz;
+        float pdf = directionRT.w;
+        ObjectData hitObj;
+        ReservoirSample reservoirSample = EmptyRS();
+        float3 accumColor = float3(0, 0, 0);
+        uint seed = id.x * id.y % 100;
+        float2 rand2 = _NoiseTex[int2(id.x % 256, id.y % 256)].xy;
+        if (depth >= _FarClipPlane)
+        {
+            _ReservoirBuffer[GetBufferIndex(index)] = reservoirSample;
+            _RadianceResult[index] = float4(0, 0, 0, 0);
+        }
+        else
+        {
+            RayMarchResult hitResult = RayMarchSDFWithBVH(ray.origin, ray.direction, 5000.0, 128, hitObj);
+
+            float3 color = float3(0, 0, 0);
+            float3 outAlbedo = float3(0, 0, 0);
+            float3 outNormal = float3(0, 0, 0);
+            half3 outEmissive = half3(0, 0, 0);
+            float outMetallic = 0;
+            float outSmoothness = 0;
+            half4 outRadiosityAtla = half4(0, 0, 0, 0);
+
+            RaySample newSample;
+            newSample.pdf = 0;
+            newSample.radiance = 0;
+            newSample.pos = 0;
+            newSample.path = 0;
+            newSample.endNormal = 0;
+            newSample.hit = 0;
+            if (hitResult.hit == true)
+            {
+                float3 outAlbedo = float3(0, 0, 0);
+                float3 outNormal = float3(0, 0, 0);
+                half3 outEmissive = half3(0, 0, 0);
+                float outMetallic = 0;
+                float outSmoothness = 0;
+                half4 outRadiosityAtla = half4(0, 0, 0, 0);
+                GetSurfaceCacheData(hitObj, mul(hitObj.worldToLocalAffineMatrix, float4(hitResult.hitPosition, 1)).xyz, outAlbedo, outNormal, outEmissive, outMetallic, outSmoothness, outRadiosityAtla);
+                float3 outputColor = outRadiosityAtla.xyz * _LocalSDFGetIlluminationIntensity + outEmissive * _EmissionIntensity;
+                if (ComputeLuminance(outputColor) > 0.1)
+                {
+                    
+                    color = CookTorranceBRDF(normal, -screenRay.direction, ray.direction, outputColor, metallic.xyz, 1 - metallic.w);
+ 
+                }
+                newSample.pdf = pdf;
+                newSample.radiance = color;
+                newSample.pos = hitResult.hitPosition;
+                newSample.path = hitResult.hitPosition - pos;
+                newSample.endNormal = outNormal;
+                newSample.hit = 1;
+            }
+            else
+            {
+                newSample.pdf = pdf;
+                newSample.radiance = 0;
+
+            }
+        
+            UpdateReservoir(reservoirSample, newSample, float4(rand2, seed, _TimeSeed));
+            accumColor = GetReservoirResult(reservoirSample);
+            float targetPDF = EvaluateTargetPDF(reservoirSample.selected, pos, normal, metallic);
+            reservoirSample.eWeight = reservoirSample.weightSum / ((float) max(reservoirSample.count, 1) * max(targetPDF, 0.1));
+            _ReservoirBuffer[GetBufferIndex(index)] = reservoirSample;
+            _RadianceResult[index] = float4(hitResult.hit ? float3(1, 1, 1) : float3(0, 0, 0), 0);
+            //_RadianceResult[index] = float4(GetReservoirResult(reservoirSample), 0);
+
+        }
+
+        PERSIST_CHECK(gtID)
+    }
+}
+[numthreads(GROUP_THREADS, 1, 1)]
+void GlobalVoxelDiffuse(uint3 id : SV_DispatchThreadID, uint3 gtID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+    
+    PERSIST_PRE(gtID)
+    [loop]
+    while (true)
+    {
+        PERSIST_INIT(gtID)
+        PERSIST_POP(index)
+
+        float depth;
+        float3 pos;
+        float3 normal;
+        float4 metallic;
+        GetGBuffer(index * _IndirectResolutionScaleInv, pos, depth, normal, metallic);
+        int2 cascadesIndex = GetCascadesCenterIndex(index);
+        float4 directionRT = _CascadesDirectionRT[index];
+        Ray screenRay = ScreenToRay((float2) index, float2(_RadianceCascadesRTSize), _ProjectionMatrixInverse, _ViewMatrixInverse);
+        Ray ray;
+        ray.origin = pos;
+        ray.direction = directionRT.xyz;
+        float pdf = directionRT.w;
+        float3 lightDir = ray.direction;
+        ObjectData hitObj;
+        ReservoirSample reservoirSample = EmptyRS();
+        float3 accumColor = float3(0, 0, 0);
+        uint seed = id.x * id.y % 100;
+        float2 rand2 = _NoiseTex[int2(id.x % 256, id.y % 256)].xy;
+        
+        half traceLerp = _BlendMaskRT[index];
+        GlobalVoxel voxel;
+        if (depth >= _FarClipPlane)
+        {
+            _ReservoirBuffer[GetBufferIndex(index)] = reservoirSample;
+            _RadianceResult[index] = float4(0, 0, 0, 0);
+        }
+        else
+        {
+            if (traceLerp < 1)
+            {
+                float3 color;
+                float pdf;
+                float3 outAlbedo = float3(0, 0, 0);
+                float3 outNormal = float3(0, 0, 0);
+                half3 outEmissive = half3(0, 0, 0);
+                float outMetallic = 0;
+                float outSmoothness = 0;
+                half4 outRadiosityAtla = half4(0, 0, 0, 0);
+                RaySample newSample;
+                newSample.pdf = 0;
+                newSample.radiance = 0;
+                newSample.pos = 0;
+                newSample.path = 0;
+                newSample.endNormal = 0;
+                RayTraceResult hitResult = GlobalVoxelRayTrace(ray.origin, ray.direction, 100000.0, 128, voxel);
+                if (hitResult.hit == true)
+                {
+                    color = CookTorranceBRDF(normal, -screenRay.direction, ray.direction, (DecodeRGBAuint(voxel.AlbedoFront).xyz + DecodeRGBAuint(voxel.FinalRadiosityAtlas).xyz).xyz, metallic.xyz, 1 - metallic.w);
+                    newSample.pdf = pdf;
+                    newSample.radiance = color;
+                    newSample.pos = hitResult.hitPosition;
+                    newSample.path = hitResult.hitPosition - pos;
+                    newSample.endNormal = outNormal;
+
+                }
+                else
+                {
+                    color = CookTorranceBRDF(normal, -screenRay.direction, ray.direction, SampleEnvironment(lightDir).xyz * _EnvironmentLightIntensity, metallic.xyz, 1 - metallic.w);
+                    newSample.pdf = pdf;
+                    newSample.radiance = color;
+                    hitResult.hitPosition = ray.origin + ray.direction * 1000;
+                    newSample.pos = hitResult.hitPosition;
+                    newSample.path = hitResult.hitPosition - pos;
+                    newSample.endNormal = outNormal;
+
+                }
+        
+                UpdateReservoir(reservoirSample, newSample, float4(rand2, seed, 1 + _TimeSeed));
+    
+                ReservoirSample originSample = _ReservoirBuffer[GetBufferIndex(index)];
+
+                float targetPDF = EvaluateTargetPDF(reservoirSample.selected, pos, normal, metallic);
+                reservoirSample.eWeight = reservoirSample.weightSum / ((float) max(reservoirSample.count, 1) * max(targetPDF, 0.1));
+                reservoirSample.weightSum = lerp(reservoirSample.weightSum, originSample.weightSum, traceLerp);
+                reservoirSample.eWeight = lerp(reservoirSample.eWeight, originSample.eWeight, traceLerp);
+                reservoirSample.selected.pdf = lerp(reservoirSample.selected.pdf, originSample.selected.pdf, traceLerp);
+                reservoirSample.selected.radiance = lerp(reservoirSample.selected.radiance, originSample.selected.radiance, traceLerp);
+                float random = saturate(FastHash(float4(rand2, seed + _TimeSeed, 4 + _TimeSeed)));
+                if (random < traceLerp)
+                {
+
+                    
+                }
+                else
+                {
+                    reservoirSample.selected.pos = originSample.selected.pos;
+                    reservoirSample.selected.path = originSample.selected.path;
+                    reservoirSample.selected.endNormal = originSample.selected.endNormal;
+                }
+                accumColor = GetReservoirResult(reservoirSample);
+                //----------------------DebugCode----------------------
+                _ReservoirBuffer[GetBufferIndex(index)] = reservoirSample;
+
+                
+            }
+            else
+            {
+                accumColor = GetReservoirResult(_ReservoirBuffer[GetBufferIndex(index)]);
+            }
+            //----------------------DebugCode----------------------
+            accumColor = GetReservoirResult(_ReservoirBuffer[GetBufferIndex(index)]);
+            _RadianceResult[index] = float4(accumColor, 0);
+        }
+
+        PERSIST_CHECK(gtID)
+    }
+}
+[numthreads(GROUP_THREADS, 1, 1)]
+void LocalSDFDirectLightSample(uint3 id : SV_DispatchThreadID, uint3 gtID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+
+    PERSIST_PRE(gtID)
+    [loop]
+    while (true)
+    {
+        PERSIST_INIT(gtID)
+        PERSIST_POP(index)
+
+        float depth;
+        float3 pos;
+        float3 startNormal;
+        float2 noise = GetNoise(id.xy);
+        GetGBuffer(index * _ResolutionScaleInv, pos, depth, startNormal, noise);
+        LightSample lightSample = SampleSceneLightsRandom(pos, startNormal, FastHash(float4(noise * 114, _TimeSeed * id.xy)), index);
+        int count = 1;
+        float initW = GetSampleWeight(lightSample);
+        //[unroll]
+        for (int i = 0; i < 16; i++)
+        {
+            LightSample mSample = SampleSceneLightsRandom(pos, startNormal, FastHash(float4(noise * (float) i, _TimeSeed * id.xy)), index);
+            count++;
+            float lastW = initW;
+            initW += GetSampleWeight(mSample);
+            if (FastHash(float4(noise * i, i * id.xy)) * initW >= lastW)
+            {
+                lightSample = mSample;
+            }
+        }
+           
+        Ray ray;
+        ray.origin = pos;
+        ray.direction = lightSample.L;
+        
+        if (ComputeLuminance(lightSample.Le) != 0)
+        {
+            ObjectData hitObj;
+            RayMarchResult hitResult = RayMarchSDFWithBVH(ray.origin + ray.direction * (_LocalSDFStartOffest), ray.direction, 100000.0, 128, hitObj);
+            if (hitResult.hit)
+            {
+                if (length(ray.origin - hitResult.hitPosition) < lightSample.dist)
+                {
+                    lightSample = MakeMissSample();
+                }
+
+            }
+
+        }
+        ReservoirLightSample reservoir;
+        reservoir.count = 17;
+        reservoir.selected = lightSample;
+        reservoir.weightSum = initW;
+        uint index1D = Get1DIndex(index, _DownResolution.x);
+        _DLReservoirBuffer[index1D] = reservoir;
+
+        PERSIST_CHECK(gtID)
+    }
+
+    
+}
+
+[numthreads(8, 8, 1)]
+void LightProbeSHGet(uint3 id : SV_DispatchThreadID)
+{
+
+    int2 startIndex = id.xy * _CascadeStride;
+    int dstlevel = (int) _SparseLightLevel.Load(int3(startIndex, 0));
+    int probeLength = exp2(dstlevel);
+    L2_RGB radianceSH = L2_RGB::Zero();
+    if (all(IsInteger2_Component((float2) startIndex / probeLength)))
+    {
+        //Local 0 point
+        for (int i = 0; i < probeLength; i++)
+        {
+            for (int j = 0; j < probeLength; j++)
+            {
+            
+                int2 index2D = startIndex + int2(i, j);
+                index2D = clamp(index2D, int2(0, 0), _DownResolution - int2(1, 1));
+                float4 lum = _RadianceResult[index2D];
+                float3 direction = _CascadesDirectionRT[index2D];
+                radianceSH = Add(radianceSH, ProjectOntoL2_RGB(direction, lum.xyz));
+
+            }
+        }
+        radianceSH = Multiply(radianceSH, 1.0f / (probeLength * probeLength));
+        StoreSH(id.xy, radianceSH);
+    }
+
+
+}
+
+inline uint GetHistoryReservoir1DIndex_Cascades(int2 index, int level)//level(0 ---- historyLevel - 1)
+{
+    return index.x + index.y * _RadianceCascadesRTSize.x + level * _RadianceCascadesRTSize.x * _RadianceCascadesRTSize.y;
+}
+
+[numthreads(8, 8, 1)]
+void ReservoirInput(uint3 id : SV_DispatchThreadID)
+{ /* ------------------If use temporalReuse -----------------
+    uint2 centerID = id.xy * _CascadeStride;
+    float3 pos;
+    float3 normal;
+    GetGBuffer(centerID, pos, normal);
+    uint centerIndex1D = GetReservoir1DIndex_Cascades(id.xy);
+    uint rngState = centerIndex1D;
+    ReservoirSample mainRes = _ReservoirBuffer[centerIndex1D];
+    int currentIndex = GetHistoryReservoir1DIndex_Cascades(id.xy, 0);
+    ReservoirSample prevRes = _HistoryBuffer[currentIndex];
+    _HistoryBuffer[currentIndex] = mainRes;
+    
+    for (uint i = 1; i < _HistoryCount; i++)
+    {
+        int currentIndex = GetHistoryReservoir1DIndex_Cascades(id.xy, i);
+        mainRes = _HistoryBuffer[currentIndex];
+        _HistoryBuffer[currentIndex] = prevRes;
+        prevRes = mainRes;
+    }
+    */
+}
+[numthreads(8, 8, 1)]
+void ReservoirInputDL(uint3 id : SV_DispatchThreadID)
+{
+    int index = Get1DIndex(id.xy, _DownResolution.x);
+    ReservoirLightSample historyRes = _DLReservoirBuffer[index];
+
+    _DLHistoryBuffer[index] = historyRes;
+
+}
+inline float3 GetLResLocalPos(ReservoirLightSample res)
+{
+    return -res.selected.L * res.selected.dist + _LightsBuffer[res.selected.index].positionWS;
+
+}
+[numthreads(8, 8, 1)]
+void DLTemporalReuse(uint3 id : SV_DispatchThreadID)
+{
+
+    float2 mv = round(_MotionVectorRT[id.xy * (uint)_ResolutionScaleInv].xy * _DownResolution);
+
+    int2 prevUV = id.xy - (int2) mv;
+
+    if (!all((prevUV >= int2(1, 1)) & (prevUV < int2(_DownResolution.x - 1, _DownResolution.y - 1))))
+    {
+        ReservoirLightSample mainRes = _DLReservoirBuffer[Get1DIndex(id.xy, _DownResolution.x)];
+        _DLTemporalReservoir[Get1DIndex(id.xy, _DownResolution.x)] = mainRes;
+        return;
+    }
+    float3 pos;
+    float3 normal;
+    GetGBuffer(id.xy * _ResolutionScaleInv, pos, normal);
+    uint centerIndex1D = Get1DIndex(id.xy, _DownResolution.x);
+    uint rngState = centerIndex1D;
+    ReservoirLightSample mainRes = _DLReservoirBuffer[centerIndex1D];
+
+    ReservoirLightSample historyRes = _DLHistoryBuffer[Get1DIndex(prevUV, _DownResolution.x)];
+    static int2 offsets[8] = { int2(-1, -1), int2(1, -1), int2(0, -1), int2(-1, 0), int2(1, 0), int2(-1, 1), int2(1, 1), int2(0, 1) };
+    float3 localPos = pos;
+    float minDist = length(localPos - GetLResLocalPos(historyRes));
+    float checkDist = minDist;
+    for (int i = 0; i < 8; ++i)
+    {
+        int2 offest = offsets[i];
+        uint2 index = clamp(prevUV + offest, int2(0, 0), _DownResolution);
+        ReservoirLightSample testRes = _DLHistoryBuffer[Get1DIndex(index, _DownResolution.x)];
+        float dist = length(localPos - GetLResLocalPos(historyRes));
+        if (dist < minDist)
+        {
+            minDist = dist;
+            historyRes = testRes;
+
+        }
+    }
+    if (checkDist < 0.1 || abs(ComputeLuminance(historyRes.selected.Le) - ComputeLuminance(mainRes.selected.Le)) < 0.1)
+    {
+        ReuseTemporalSample(historyRes, mainRes, pos, normal, float4(centerIndex1D, _TimeSeed, id.xy * _TimeSeed));
+    }
+
+
+    _DLTemporalReservoir[centerIndex1D] = mainRes;
+    //_DLReservoirBuffer[centerIndex1D] = mainRes;
+
+
+}
+[numthreads(8, 8, 1)]
+void DLSpatialReuse(uint3 id : SV_DispatchThreadID)
+{
+    uint2 centerID = id.xy;
+    float3 pos;
+    float3 normal;
+    GetGBuffer(centerID * _ResolutionScaleInv, pos, normal);
+    uint centerIndex1D = Get1DIndex(id.xy, _DownResolution.x);
+    uint rngState = centerIndex1D;
+    ReservoirLightSample mainRes = _DLTemporalReservoir[centerIndex1D];
+    
+    ReuseSpatialSamples(id.xy, pos, normal, mainRes, (uint) round(Rand(rngState)));
+
+    _DLReservoirBuffer[centerIndex1D] = mainRes;
+
+}
+
+[numthreads(8, 8, 1)]
+void TemporalReuse(uint3 dtid : SV_DispatchThreadID)
+{
+    float2 mv = round(_MotionVectorRT[_ActiveRTSize * ((float2) dtid.xy / float2(_RadianceCascadesRTSize.x, _RadianceCascadesRTSize.y))].xy * float2(_RadianceCascadesRTSize.x, _RadianceCascadesRTSize.y));
+    uint2 pixelCoord = dtid.xy;
+    int2 prevUV = dtid.xy - (int2) mv;
+    if (pixelCoord.x >= (uint) _RadianceCascadesRTSize.x || pixelCoord.y >= (uint) _RadianceCascadesRTSize.y)
+        return;
+    if (!all((prevUV >= int2(1, 1)) & (prevUV < int2(_RadianceCascadesRTSize.x - 1, _RadianceCascadesRTSize.y - 1))))
+    {
+        ReservoirSample mainRes = _ReservoirBuffer[GetBufferIndex(pixelCoord)];
+        _TemporalReservoir[GetBufferIndex(pixelCoord)] = mainRes;
+        return;
+    }
+    float3 currentPos;
+    float3 currentNorm;
+    float depth;
+    float4 metallic;
+    GetGBuffer(pixelCoord * _IndirectResolutionScaleInv, currentPos, depth, currentNorm, metallic);
+    ReservoirSample currentRes = _ReservoirBuffer[GetBufferIndex(pixelCoord)];
+
+    float2 rand2 = _NoiseTex[int2(pixelCoord.x % 256, pixelCoord.y % 256)].xy;
+    for (int i = 0; i < _HistoryCount; i++)
+    {
+        int index = i;
+        ReservoirSample historyRes = _HistoryBuffer[GetHistoryBufferIndex(prevUV, index)];
+
+        if (distance((historyRes.selected.pos - historyRes.selected.path), (currentRes.selected.pos - currentRes.selected.path)) < 0.1)
+        {
+            MergeReservoir(currentRes, historyRes, float4(i, rand2, index + _TimeSeed));
+        }
+
+
+    }
+    const int sampleCount = 30;
+    if (currentRes.count > sampleCount)
+    {
+        int oCount = currentRes.count;
+        float scale = (float) sampleCount / (float) oCount;
+        currentRes.count = sampleCount;
+        currentRes.weightSum *= scale;
+        currentRes.eWeight *= scale;
+
+    }
+    float targetPDF = EvaluateTargetPDF(currentRes.selected, currentPos, currentNorm, metallic);
+    currentRes.eWeight = currentRes.weightSum / ((float) max(currentRes.count, 1) * max(targetPDF, 0.1));
+
+    _TemporalReservoir[GetBufferIndex(pixelCoord)] = currentRes;
+    _RadianceResult[pixelCoord] = float4(GetReservoirResult(currentRes), 0);
+}
+[numthreads(8, 8, 1)]
+void HistoryFeedBack(uint3 dtid : SV_DispatchThreadID)
+{
+    float2 mv = round(_MotionVectorRT[_ActiveRTSize * ((float2) dtid.xy / float2(_RadianceCascadesRTSize.x, _RadianceCascadesRTSize.y))].xy * float2(_RadianceCascadesRTSize.x, _RadianceCascadesRTSize.y));
+    uint2 pixelCoord = dtid.xy;
+    int2 prevUV = dtid.xy - (int2) mv;
+    if (pixelCoord.x >= (uint) _RadianceCascadesRTSize.x || pixelCoord.y >= (uint) _RadianceCascadesRTSize.y)
+        return;
+    /*
+    for (int i = 1; i < _HistoryCount; i++)
+    {
+        int index = i;
+        int2 aftUV = dtid.xy + (int2) mv;
+        ReservoirSample historyRes = _HistoryBuffer[GetHistoryBufferIndex(aftUV, i - 1)];
+        if (pixelCoord.x >= (uint) _RadianceCascadesRTSize.x || pixelCoord.y >= (uint) _RadianceCascadesRTSize.y)
+        {
+            _HistoryBuffer[GetHistoryBufferIndex(pixelCoord, i)] = EmptyRS();
+        }
+        _HistoryBuffer[GetHistoryBufferIndex(pixelCoord, i)] = historyRes;
+
+    }
+    */
+    ReservoirSample currentRes = _TemporalReservoir[GetBufferIndex(pixelCoord)];
+    _HistoryBuffer[GetHistoryBufferIndex(pixelCoord, 0)] = currentRes;
+
+}
+
+[numthreads(8, 8, 1)]
+void SpatialReuse(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dtid.xy;
+    if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
+        return;
+    ReservoirSample currentRes = _TemporalReservoir[GetBufferIndex(pixelCoord)];
+    float3 currentPos;
+    float3 currentNorm;
+    float depth;
+    float4 currentMet;
+    GetGBuffer(pixelCoord * _IndirectResolutionScaleInv, currentPos, depth, currentNorm, currentMet);
+    static int2 offsets[8] = { int2(-1, -1), int2(1, -1), int2(0, -1), int2(-1, 0), int2(1, 0), int2(-1, 1), int2(1, 1), int2(0, 1) };
+    for (int i = 0; i < 8; ++i)
+    {
+        int2 neighIndex = pixelCoord + offsets[i];
+        if (neighIndex.x < 0 || neighIndex.y < 0 ||
+            neighIndex.x >= _ScreenWidth || neighIndex.y >= _ScreenHeight)
+        {
+            continue;
+        }
+        ReservoirSample neighRes = _TemporalReservoir[GetBufferIndex(neighIndex)];
+        RaySample neighSample = neighRes.selected;
+        float3 neighPos;
+        float3 neighNorm;
+        float4 neighMet;
+        GetGBuffer(neighIndex * _IndirectResolutionScaleInv, neighPos, depth, neighNorm, neighMet);
+        float np = dot(currentRes.selected.endNormal, normalize(-currentRes.selected.path));
+        float nq = dot(currentRes.selected.endNormal, normalize(-neighRes.selected.path));
+        float rp = length(currentRes.selected.path);
+        float rq = length(neighRes.selected.path);
+        float rp2 = rp * rp;
+        float rq2 = rq * rq;
+        float jacobian = (nq * rp2) / (np * rq2);
+        if (np <= 0 || nq <= 0)
+        {
+            continue;
+        }
+        
+        float targetPDF = EvaluateTargetPDF(currentRes.selected, neighPos, neighNorm, neighMet);
+        targetPDF = targetPDF / jacobian;
+        neighRes.weightSum = neighRes.eWeight * (float) neighRes.count * targetPDF;
+        MergeReservoir(currentRes, neighRes, float4(_TimeSeed * i, i, offsets[i]));
+
+    }
+    const int sampleCount = 500;
+    if (currentRes.count > sampleCount)
+    {
+        int oCount = currentRes.count;
+        float scale = (float) sampleCount / (float) oCount;
+        currentRes.count = sampleCount;
+        currentRes.weightSum *= scale;
+        currentRes.eWeight *= scale;
+
+    }
+    float targetPDF = EvaluateTargetPDF(currentRes.selected, currentPos, currentNorm, currentMet);
+    currentRes.eWeight = currentRes.weightSum / ((float) max(currentRes.count, 1) * max(targetPDF, 0.1));
+
+    _ReservoirBuffer[GetBufferIndex(pixelCoord)] = currentRes;
+    
+}
+
+
+
+RWTexture2D<float> _Confidence;
+float3 FinalIndirectRadiance(in ReservoirSample res)
+{
+    if (res.count == 0)
+    {
+        return float3(0, 0, 0);
+
+    }
+    float outputWeight = res.weightSum / res.count;
+    return res.selected.radiance * outputWeight;
+}
+
+float3 FinalIndirectRadiance(in ReservoirLightSample res)
+{
+    if (res.count == 0)
+    {
+        return float3(0, 0, 0);
+
+    }
+    float outputWeight = res.weightSum / res.count;
+    return res.selected.Le * outputWeight;
+}
+
+
+[numthreads(8, 8, 1)]
+void OutputLum(uint3 id : SV_DispatchThreadID)
+{
+
+    uint2 pixelCoord = id.xy;
+    if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
+        return;
+    float2 uv = (float2) pixelCoord / float2(_RadianceCascadesRTSize);
+    ReservoirSample currentRes = _ReservoirBuffer[GetBufferIndex(pixelCoord)];
+    float3 accumColor = GetReservoirResult(currentRes);
+    if (abs(ComputeLuminance(accumColor)) > 30)
+    {
+        accumColor = 0;
+
+    }
+    float hitC = 1;
+    if (currentRes.selected.hit == 1)
+    {
+        float3 hitPos = float3(0, 0, 0);
+        SSRCalculate(uv, normalize(currentRes.selected.path), hitPos);
+        if (all(hitPos))
+        {
+
+            hitC = saturate(1 / (currentRes.selected.pos - hitPos) / 3);
+            hitC = 0;
+
+        }
+    }
+    _ResultTarget[pixelCoord] = float4(accumColor, hitC);
+}
+[numthreads(GROUP_THREADS, 1, 1)]
+void SpecularSSR(uint3 id : SV_DispatchThreadID, uint3 gtID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+    PERSIST_PRE(gtID)
+    [loop]
+    while (true)
+    {
+        PERSIST_INIT(gtID);
+        PERSIST_POP(index);
+
+        uint2 pixelCoord = index;
+        float2 uv = (float2) index / _ScreenSize_SSR * _SpecularResolutionScaleInv;
+        //float4 color = SSRCalculate(uv);
+        float depth = LinearEyeDepth(_DepthTexture[pixelCoord.xy].x);
+        Ray ray = ScreenToRay((float2) pixelCoord, _SpecularDownResolution, _ProjectionMatrixInverse, _ViewMatrixInverse);
+        float3 startWorldPos = UVToWorld((float2) pixelCoord / _SpecularDownResolution, depth);
+        
+        float smoothness = (1 - _GBufferMetallicRT[index * _SpecularResolutionScaleInv].w);
+        smoothness = clamp(smoothness, 0, 0.5);
+        float coneAngle = atan(smoothness * smoothness) * 2 * 180 / 3.1415926;
+        Ray reflectRay;
+        float3 startNormal = _NormalTexture[pixelCoord * _SpecularResolutionScaleInv].xyz;
+        reflectRay.direction = reflect(ray.direction, startNormal);
+        reflectRay.origin = startWorldPos;
+        uint seed = pixelCoord.x * pixelCoord.y % 100;
+        float3 color = SSRCalculate(uv, normalize(SampleConeDirection(reflectRay.direction, coneAngle, seed)));
+        float3 finalColor = color;
+        _SpecularRT[pixelCoord] = float4(finalColor, 1.0);
+        PERSIST_CHECK(gtID)
+    }
+
+
+}
+[numthreads(GROUP_THREADS, 1, 1)]
+void SpecularLS(uint3 id : SV_DispatchThreadID, uint3 gtID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+    PERSIST_PRE(gtID)
+    [loop]
+    while (true)
+    {    
+        PERSIST_INIT(gtID);
+        PERSIST_POP(index);
+
+        uint2 pixelCoord = index;
+        float depth = LinearEyeDepth(_DepthTexture[pixelCoord.xy * _SpecularResolutionScaleInv].x);
+        Ray ray = ScreenToRay((float2) pixelCoord, _SpecularDownResolution, _ProjectionMatrixInverse, _ViewMatrixInverse);
+        float3 startWorldPos = UVToWorld((float2) pixelCoord / _SpecularDownResolution, depth);
+        half traceLerp = _BlendMaskRT[index];
+        float smoothness = (1 - _GBufferMetallicRT[index * _SpecularResolutionScaleInv].w);
+        if (smoothness <= 0.3)
+        {
+            float coneAngle = atan(smoothness * smoothness) * 2 * 180 / 3.1415926;
+            Ray reflectRay;
+            float3 startNormal = _NormalTexture[pixelCoord * _SpecularResolutionScaleInv].xyz;
+            reflectRay.direction = reflect(ray.direction, startNormal);
+            reflectRay.origin = startWorldPos + startNormal * depth * _LocalSDFStartOffest;
+            uint seed = pixelCoord.x * pixelCoord.y % 100;
+            if (traceLerp != 1)
+            {
+                float3 color = PathTrace(reflectRay.origin, normalize(SampleConeDirection(reflectRay.direction, coneAngle, seed)), ray.direction, startNormal, pixelCoord, 0, 1);
+                float3 finalColor = color;
+                _SpecularRT[pixelCoord] = lerp(float4(finalColor, 1.0), _SpecularRT[pixelCoord], traceLerp);
+            }
+        }
+        PERSIST_CHECK(gtID)
+    }
+
+
+}
+
+[numthreads(GROUP_THREADS, 1, 1)]
+void SpecularGV(uint3 id : SV_DispatchThreadID, uint3 gtID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+    PERSIST_PRE(gtID)
+    [loop]
+    while (true)
+    {
+        PERSIST_INIT(gtID);
+        PERSIST_POP(index);
+
+        uint2 pixelCoord = index;
+        float depth = LinearEyeDepth(_DepthTexture[pixelCoord.xy * _SpecularResolutionScaleInv].x);
+        Ray ray = ScreenToRay((float2) pixelCoord, _SpecularDownResolution, _ProjectionMatrixInverse, _ViewMatrixInverse);
+        float3 startWorldPos = UVToWorld((float2) pixelCoord / _SpecularDownResolution, depth);
+        float smoothness = (1 - _GBufferMetallicRT[index * _SpecularResolutionScaleInv].w);
+        float coneAngle = atan(smoothness * smoothness) * 2 * 180 / 3.1415926;
+        Ray reflectRay;
+        float3 startNormal = _NormalTexture[pixelCoord * _SpecularResolutionScaleInv].xyz;
+        reflectRay.direction = reflect(ray.direction, startNormal);
+        reflectRay.origin = startWorldPos + startNormal * depth * _LocalSDFStartOffest;
+        uint seed = pixelCoord.x * pixelCoord.y % 100;
+        const float spp = 8;
+        if (smoothness >= 0.2)
+        {
+
+            GlobalVoxel voxel;
+            float4 finalColor;
+            for (int i = 0; i < spp; i++)
+            { 
+                RayTraceResult result = GlobalVoxelRayTrace(reflectRay.origin, normalize(SampleConeDirection(reflectRay.direction, coneAngle, seed)), 10000, 20, voxel);
+                if (result.hit)
+                {
+                    finalColor += DecodeRGBAuint(voxel.RadiosityAtlas);
+                }
+                else
+                {
+                    finalColor += SampleEnvironment(ray.direction) * _EnvironmentLightIntensity;
+
+                }
+
+
+            }
+            finalColor /= spp;
+            float4 originColor = _SpecularRT[pixelCoord];
+            float t = saturate((smoothness - 0.2) / (0.3 - 0.2));
+            _SpecularRT[pixelCoord] = lerp(originColor, finalColor, t);
+        }
+
+        PERSIST_CHECK(gtID)
+    }
+
+
+}
+
+[numthreads(8, 8, 1)]
+void DirectLight(uint3 id : SV_DispatchThreadID)
+{
+    int2 pixelCoord = id.xy;
+    int index = Get1DIndex(pixelCoord, _DownResolution.x);
+    ReservoirLightSample reservoirLightSample = _DLReservoirBuffer[index];
+    LightBufferData lightData = _LightsBuffer[reservoirLightSample.selected.index];
+    float depth;
+    float3 pos;
+    float3 startNormal;
+    GetGBuffer(pixelCoord * int2(_ResolutionScaleInv, _ResolutionScaleInv), pos, depth, startNormal);
+    float4 finalColor = float4(FinalIndirectRadiance(reservoirLightSample), 0);
+    [flatten]
+    if (ComputeLuminance(SampleSceneLights(pos, startNormal, lightData, reservoirLightSample.selected.index, pixelCoord).Le) == 0)
+    {
+        finalColor = float4(0, 0, 0, 0) + float4(0, 0.01, 0, 0);
+
+    }
+    float2 noise = GetNoise(id.xy);
+    noise = 1 + (noise - 0.5) * 0;
+    float n = lerp(1, noise.x, _NoiseIntensity);
+    _DirectLightRT[pixelCoord] = finalColor * n + float4(0, 0.01, 0, 0);
+
+}
+
+[numthreads(8, 8, 1)]
+void SpecularRoughMix(uint3 id : SV_DispatchThreadID)
+{
+    float smoothness = 1 - _GBufferMetallicRT[id.xy * _SpecularResolutionScaleInv].w;
+    float coneAngle = atan(smoothness * smoothness) * 2 * 180 / 3.1415926;
+    float4 specular = _SpecularRT[id.xy];
+    float4 specularRough = _SpecularRoughRT[id.xy];
+    float4 result = lerp(specular, specularRough, saturate(coneAngle / 2));
+    _SpecularRT[id.xy] = result;
+}
+[numthreads(8, 8, 1)]
+void OutputColor(uint3 id : SV_DispatchThreadID)
+{
+
+    int2 pixelCoord = id.xy;
+    float3 indirectLightLum = _LumResult.SampleLevel(sampler_LumResult, (float2) pixelCoord / _ActiveRTSize, 0);
+    float4 finalColor = 0;
+    float4 specularColor = _Specular.SampleLevel(sampler_LumResult, (float2) pixelCoord / _ActiveRTSize, 0);
+    float4 metallicRT = _GBufferMetallicRT[pixelCoord];
+
+    float rawDepth = _DepthTexture[pixelCoord].x;
+    float depth = LinearEyeDepth(rawDepth);
+    float3 pos = UVToWorld((float2) pixelCoord / (float2) _ActiveRTSize, depth);
+    float3 startNormal = _NormalTexture[pixelCoord].xyz;
+    Ray sceneRay = ScreenToRay((float2) pixelCoord, float2((float) _ScreenWidth, (float) _ScreenHeight), _ProjectionMatrixInverse, _ViewMatrixInverse);
+    float directLightHit = 1;
+
+    float3 F0 = metallicRT.xyz;
+    float metallic = (metallicRT.x + metallicRT.y + metallicRT.z) / 3;
+    float VdotH = max(dot(normalize(-sceneRay.direction), normalize(startNormal)), 0.0f);
+    float3 kS = SchlickFresnel(F0, VdotH);
+    float kD = (1.0 - metallic);
+   
+    finalColor.xyz += _ShadowRT[pixelCoord] * saturate(dot(_LightDirection, startNormal)) * _LightColor + _DirectLight.SampleLevel(sampler_DirectLight, (float2) pixelCoord / _ActiveRTSize, 0).xyz * directLightHit;
+    specularColor.xyz *= kS;
+    finalColor.xyz *= kD;
+    finalColor.xyz += indirectLightLum;
+    float4 activeColor = _ActiveTexture[id.xy];
+    finalColor *= activeColor;
+    //finalColor = _LumResult.SampleLevel(sampler_LumResult, (float2) pixelCoord / _ActiveRTSize, 0);
+    ObjectData hitObj;
+    Ray ray;
+    ray.direction = -startNormal;
+    ray.origin = pos;
+    if (all(pixelCoord % _FeedBackResolution == int2(0, 0)))
+    {
+        RayMarchResult hitResult = RayMarchSDFWithBVH(ray.origin - ray.direction * 0.01, ray.direction, 10.0, 128, hitObj);
+        float3 radiance = clamp(finalColor.xyz * _IndirectIlluminationIntensity + specularColor.xyz, 0, 200);
+        SetSurfaceCache(hitObj, mul(hitObj.worldToLocalAffineMatrix, float4(hitResult.hitPosition, 1)).xyz, radiance);
+        SetGlobalVoxel(pos, radiance);
+    }
+    //SetSurfaceCache[finalColor.xyz + specularColor.xyz] although it’s not that physically accurate, it can greatly enhance the sense of realism.
+    [flatten]
+    if (rawDepth == 0)
+    {
+        finalColor = activeColor;
+
+    }
+    else
+    {
+        finalColor = finalColor + specularColor + _GBufferEmissionRT[pixelCoord] ;
+
+    }
+    _ResultTarget[pixelCoord] = finalColor;
+
+}
+
+
+[numthreads(64, 1, 1)]
+void FillDLBuffer(uint3 id : SV_DispatchThreadID)
+{
+    ReservoirLightSample res;
+    res.count = 1;
+    res.selected = MakeMissSample();
+    res.weightSum = 0;
+    _DLHistoryBuffer[id.x] = res;
+
+}
+
+[numthreads(8, 8, 8)]
+void SampleGlobalProbes(uint3 id : SV_DispatchThreadID)
+{
+    int levelSize = _BlocksPerAxis * _BlocksPerAxis * _BlocksPerAxis;
+    int3 coord = int3(id.xy, id.z % _BlocksPerAxis);
+    int level = id.z / _BlocksPerAxis;
+
+    int probeIdx = GetGlobalRadiacneProbeIndex(coord, level);
+    GlobalRadiacneProbes probe = _GlobalRadiacneProbes[probeIdx];
+    L2_RGB radianceSH = L2_RGB::Zero();
+    if (probe.enable != 0)
+    {
+        for (int i = 0; i < _SampleCount; i++)
+        {
+            float2 random = float2(FastHash(float4(probe.worldPos.xy, id.xy)), FastHash(float4(i, i, id.xy + probe.worldPos.zy)));
+            float3 dir = SampleUniformSphere(random);
+            Ray ray;
+            ray.direction = dir;
+            ray.origin = probe.worldPos;
+            GlobalVoxel result;
+            GlobalVoxelRayTrace(ray.origin, ray.direction, 10000, 100, result);
+            radianceSH = Add(radianceSH, ProjectOntoL2_RGB(dir, DecodeRGBAuint(result.FinalRadiosityAtlas).xyz + DecodeRGBAuint(result.AlbedoFront).xyz));
+        }
+        radianceSH = Multiply(radianceSH, float3(1, 1, 1) / (float) _SampleCount);
+        probe = L2_RGB_To_GlobalRadiacneProbes(radianceSH, probe.worldPos, probe.enable);
+        _GlobalRadiacneProbes[probeIdx] = probe;
+
+    }
+
+}
+                
+[numthreads(8, 8, 8)]
+void ExtendSPRT(uint3 id : SV_DispatchThreadID)
+{
+    static int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+    float4 result;
+    int2 startUV = floor((float2) id.xy * _SpecularResolutionScale) * _SpecularResolutionScaleInv;
+    float2 uv = (float2) id.xy / _ActiveRTSize;
+    int2 resultIndex;
+    float maxDot = -1000;
+    float3 originNormal = _NormalTexture[id.xy];
+    for (int i = 0; i < 4; ++i)
+    {
+        float3 normal = _NormalTexture[startUV + offsets[i] * _SpecularResolutionScaleInv].xyz;
+
+        if (dot(normal, originNormal) > maxDot)
+        {
+            maxDot = dot(normal, originNormal);
+            resultIndex = startUV + offsets[i] * _SpecularResolutionScaleInv;
+
+        }
+    }
+    uv = floor(((float2) resultIndex / _ActiveRTSize) * _SpecularDownResolution);
+    _ExtendOriginRT[id.xy] = _OriginRT[uv];
+
+
+}
+[numthreads(8, 8, 8)]
+void ExtendIDRT(uint3 id : SV_DispatchThreadID)
+{
+    static int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+    float4 result;
+    int2 startUV = floor((float2) id.xy * _IndirectResolutionScale) * _IndirectResolutionScaleInv;
+    float2 uv = (float2) id.xy / _ActiveRTSize;
+    int2 resultIndex;
+    float maxDot = -1000;
+    float3 originNormal = _NormalTexture[id.xy];
+    for (int i = 0; i < 4; ++i)
+    {
+        float3 normal = _NormalTexture[startUV + offsets[i] * _IndirectResolutionScaleInv].xyz;
+
+        if (dot(normal, originNormal) > maxDot)
+        {
+            maxDot = dot(normal, originNormal);
+            resultIndex = startUV + offsets[i] * _IndirectResolutionScaleInv;
+
+        }
+    }
+    uv = floor(((float2) resultIndex / _ActiveRTSize) * _IndirectDownResolution);
+    _ExtendOriginRT[id.xy] = _OriginRT[uv];
+
+
+}
+       
+[numthreads(8, 8, 8)]
+void ExtendRT(uint3 id : SV_DispatchThreadID)
+{
+    static int2 offsets[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+    float4 result;
+    int2 startUV = floor((float2) id.xy * _ResolutionScale) * _ResolutionScaleInv;
+    float2 uv = (float2) id.xy / _ActiveRTSize;
+    int2 resultIndex;
+    float maxDot = -1000;
+    float3 originNormal = _NormalTexture[id.xy];
+    for (int i = 0; i < 4; ++i)
+    {
+        float3 normal = _NormalTexture[startUV + offsets[i] * _ResolutionScaleInv].xyz;
+
+        if (dot(normal, originNormal) > maxDot)
+        {
+            maxDot = dot(normal, originNormal);
+            resultIndex = startUV + offsets[i] * _ResolutionScaleInv;
+
+        }
+    }
+    uv = floor(((float2) resultIndex / _ActiveRTSize) * _DownResolution);
+    _ExtendOriginRT[id.xy] = _OriginRT[uv];
+
+
+}

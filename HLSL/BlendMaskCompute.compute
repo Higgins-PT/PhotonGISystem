@@ -1,0 +1,25 @@
+#pragma kernel MaskSet
+#pragma kernel SmoothBlendMask
+RWTexture2D<float4> _SetData;
+RWTexture2D<half> _MaskOutput;
+Texture2D<half> _MaskInput;
+float2 _InputSize;
+SamplerState sampler_MaskInput;
+int _MipLevel;
+[numthreads(8, 8, 1)]
+void MaskSet(uint3 id : SV_DispatchThreadID)
+{
+    float4 color = _SetData[id.xy];
+    float value = sign(color.x + color.y + color.z);
+    _MaskOutput[id.xy] = value;
+
+}
+[numthreads(8, 8, 1)]
+void SmoothBlendMask(uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = id.xy / _InputSize;
+    half iMask = _MaskInput.SampleLevel(sampler_MaskInput, uv, _MipLevel);
+    iMask = iMask * _MaskInput.SampleLevel(sampler_MaskInput, uv, 0);
+    _MaskOutput[id.xy] = iMask;
+
+}

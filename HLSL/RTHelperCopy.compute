@@ -1,0 +1,337 @@
+
+#pragma kernel KCopy_ARGB32
+#pragma kernel KCopy_ARGBHalf
+#pragma kernel KCopy_RHalf
+#pragma kernel KCopy_R16
+#pragma kernel KFill_ARGB32
+#pragma kernel KFill_ARGBHalf
+#pragma kernel KFill_RHalf
+#pragma kernel KFill_R16
+
+#pragma kernel KWriteBuffer_Clean_RadiosityAtlas
+#pragma kernel KWriteBuffer_ARGB32_Albedo
+#pragma kernel KWriteBuffer_ARGB32_Normal
+#pragma kernel KWriteBuffer_ARGB32_Emissive
+#pragma kernel KWriteBuffer_ARGBHalf_Albedo
+#pragma kernel KWriteBuffer_ARGBHalf_Normal
+#pragma kernel KWriteBuffer_ARGBHalf_Emissive
+#pragma kernel KWriteBuffer_RHalf_Depth
+#pragma kernel KWriteBuffer_R16_Depth
+#pragma kernel KWriteBuffer_RHalf_Metallic
+#pragma kernel KWriteBuffer_RHalf_Smoothness
+
+#pragma kernel KFillBuffer
+#pragma kernel KCopyBufferRadiosityAtlas
+
+
+// --------------- ARGB32 (float4) ---------------
+Texture2D<float4> _SourceARGB32;
+RWTexture2D<float4> _DestinationARGB32;
+
+// --------------- ARGBHalf (half4) ---------------
+Texture2D<half4> _SourceARGBHalf;
+RWTexture2D<half4> _DestinationARGBHalf;
+
+// --------------- RHalf (half) ---------------
+Texture2D<half> _SourceRHalf;
+RWTexture2D<half> _DestinationRHalf;
+
+// --------------- R16 (float) ---------------
+Texture2D<float> _SourceR16;
+RWTexture2D<float> _DestinationR16;
+
+int _OffsetX;
+int _OffsetY;
+
+RWTexture2D<float4> _TargetARGB32;
+float4 _FillColorARGB32;
+
+RWTexture2D<half4> _TargetARGBHalf;
+half4 _FillColorARGBHalf;
+
+RWTexture2D<half> _TargetRHalf;
+float _FillColorRHalf; 
+
+RWTexture2D<float> _TargetR16;
+float _FillColorR16;
+
+
+struct SurfaceCacheData
+{
+    half4 albedo;
+    half4 normal;
+    half4 emissive;
+    half4 radiosityAtlas;
+    half4 finalRadiosityAtlas;
+    float depth;
+    float metallic;
+    float smoothness;
+
+};
+
+int _SurfaceCacheWidth;
+int _SurfaceCacheCount;
+float4 _FillColorAlbedo;
+float3 _FillColorNormal;
+float4 _FillColorEmissive;
+float _FillColorDepth;
+StructuredBuffer<SurfaceCacheData> _ReadOnlySurfaceCache;
+RWStructuredBuffer<SurfaceCacheData> _SurfaceCache;
+float _SurfaceCacheDecay;
+
+RWTexture2D<float4> _SrcRT;
+RWStructuredBuffer<float4> _DstBuf;
+int _ScreenWidth;
+int _ScreenHeight;
+int _Offest;
+//----------------------------------------------------------------------------------------
+[numthreads(512, 1, 1)]
+void KCopyBufferRadiosityAtlas(uint3 id : SV_DispatchThreadID)
+{
+    int index = id.x + _Offest;
+
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.finalRadiosityAtlas = lerp(data.radiosityAtlas, data.finalRadiosityAtlas, 0.9) * _SurfaceCacheDecay;
+    _SurfaceCache[index] = data;
+}
+
+[numthreads(512, 1, 1)]
+void KFillBuffer(uint3 id : SV_DispatchThreadID)
+{
+    int index = id.x;
+    if (index >= _SurfaceCacheCount)
+        return;
+
+
+    SurfaceCacheData data = _SurfaceCache[id.x];
+
+
+    data.albedo = (half4) _FillColorAlbedo;
+    data.normal = (half4) float4(_FillColorNormal, 1);
+    data.emissive = (half4) _FillColorEmissive;
+    data.radiosityAtlas = float4(0, 0, 0, 0);
+    data.finalRadiosityAtlas = float4(0, 0, 0, 0);
+    data.depth = _FillColorDepth;
+    data.metallic = 0;
+    data.smoothness = 0;
+    _SurfaceCache[index] = data;
+}
+[numthreads(8, 8, 1)]
+void KCopy_ARGB32(uint3 id : SV_DispatchThreadID)
+{
+    float4 color = _SourceARGB32[id.xy]; 
+    int tx = id.x + _OffsetX;
+    int ty = id.y + _OffsetY;
+    _DestinationARGB32[int2(tx, ty)] = color; 
+}
+
+[numthreads(8, 8, 1)]
+void KCopy_ARGBHalf(uint3 id : SV_DispatchThreadID)
+{
+    half4 color = _SourceARGBHalf[id.xy];
+    int tx = id.x + _OffsetX;
+    int ty = id.y + _OffsetY;
+    _DestinationARGBHalf[int2(tx, ty)] = color; 
+}
+
+[numthreads(8, 8, 1)]
+void KCopy_RHalf(uint3 id : SV_DispatchThreadID)
+{
+    half val = _SourceRHalf[id.xy];
+    int tx = id.x + _OffsetX;
+    int ty = id.y + _OffsetY;
+    _DestinationRHalf[int2(tx, ty)] = val;
+}
+
+[numthreads(8, 8, 1)]
+void KCopy_R16(uint3 id : SV_DispatchThreadID)
+{
+    float val = _SourceR16[id.xy];
+    int tx = id.x + _OffsetX;
+    int ty = id.y + _OffsetY;
+    _DestinationR16[int2(tx, ty)] = val;
+}
+
+[numthreads(8, 8, 1)]
+void KFill_ARGB32(uint3 id : SV_DispatchThreadID)
+{
+
+    _TargetARGB32[int2(id.x, id.y)] = _FillColorARGB32;
+}
+
+[numthreads(8, 8, 1)]
+void KFill_ARGBHalf(uint3 id : SV_DispatchThreadID)
+{
+    _TargetARGBHalf[int2(id.x, id.y)] = _FillColorARGBHalf;
+}
+
+[numthreads(8, 8, 1)]
+void KFill_RHalf(uint3 id : SV_DispatchThreadID)
+{
+    half c = (half) _FillColorRHalf; 
+    _TargetRHalf[int2(id.x, id.y)] = c;
+}
+
+[numthreads(8, 8, 1)]
+void KFill_R16(uint3 id : SV_DispatchThreadID)
+{
+    float c = _FillColorR16;
+    _TargetR16[int2(id.x, id.y)] = c;
+}
+
+// ------------------------------------------------------
+//                WriteBuffer: ARGB32
+// ------------------------------------------------------
+[numthreads(8, 8, 1)]
+void KWriteBuffer_ARGB32_Albedo(uint3 id : SV_DispatchThreadID)
+{
+    float4 c = _SourceARGB32[id.xy];
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.albedo = (half4)c;
+    _SurfaceCache[index] = data;
+}
+
+[numthreads(8, 8, 1)]
+void KWriteBuffer_ARGB32_Normal(uint3 id : SV_DispatchThreadID)
+{
+    float4 c = _SourceARGB32[id.xy];
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.normal = float4(c.xyz, 1);
+    _SurfaceCache[index] = data;
+}
+
+[numthreads(8, 8, 1)]
+void KWriteBuffer_ARGB32_Emissive(uint3 id : SV_DispatchThreadID)
+{
+    float4 c = _SourceARGB32[id.xy];
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.emissive = (half4)c;
+    _SurfaceCache[index] = data;
+}
+
+// ------------------------------------------------------
+//                WriteBuffer: ARGBHalf
+// ------------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void KWriteBuffer_Clean_RadiosityAtlas(uint3 id : SV_DispatchThreadID)
+{
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.radiosityAtlas = half4(0, 0, 0, 0);
+    data.finalRadiosityAtlas = half4(0, 0, 0, 0);
+
+    _SurfaceCache[index] = data;
+}
+
+[numthreads(8, 8, 1)]
+void KWriteBuffer_ARGBHalf_Albedo(uint3 id : SV_DispatchThreadID)
+{
+    half4 c = _SourceARGBHalf[id.xy];
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.albedo = c;
+
+    _SurfaceCache[index] = data;
+}
+
+[numthreads(8, 8, 1)]
+void KWriteBuffer_ARGBHalf_Normal(uint3 id : SV_DispatchThreadID)
+{
+    half4 c = _SourceARGBHalf[id.xy];
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.normal = c;
+    _SurfaceCache[index] = data;
+}
+
+[numthreads(8, 8, 1)]
+void KWriteBuffer_ARGBHalf_Emissive(uint3 id : SV_DispatchThreadID)
+{
+    half4 c = _SourceARGBHalf[id.xy];
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.emissive = c;
+    _SurfaceCache[index] = data;
+}
+
+// ------------------------------------------------------
+//                WriteBuffer: RHalf / R16
+//                (for Depth)
+// ------------------------------------------------------
+[numthreads(8, 8, 1)]
+void KWriteBuffer_RHalf_Depth(uint3 id : SV_DispatchThreadID)
+{
+    half val = _SourceRHalf[id.xy];
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.depth = (float) val;
+    _SurfaceCache[index] = data;
+}
+
+[numthreads(8, 8, 1)]
+void KWriteBuffer_R16_Depth(uint3 id : SV_DispatchThreadID)
+{
+    float val = _SourceR16[id.xy];
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+    
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.depth = val;
+    _SurfaceCache[index] = data;
+}
+[numthreads(8, 8, 1)]
+void KWriteBuffer_RHalf_Metallic(uint3 id : SV_DispatchThreadID)
+{
+    half c = _SourceRHalf[id.xy].r;
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.metallic = c.r;
+
+    _SurfaceCache[index] = data;
+}
+
+[numthreads(8, 8, 1)]
+void KWriteBuffer_RHalf_Smoothness(uint3 id : SV_DispatchThreadID)
+{
+    half c = _SourceRHalf[id.xy].r;
+    int dx = id.x + _OffsetX;
+    int dy = id.y + _OffsetY;
+    int index = dx + dy * _SurfaceCacheWidth;
+
+    SurfaceCacheData data = _SurfaceCache[index];
+    data.smoothness = c.r;
+
+    _SurfaceCache[index] = data;
+}

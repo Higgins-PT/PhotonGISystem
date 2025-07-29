@@ -1,0 +1,30 @@
+
+#pragma kernel SerializeTextureToBuffer
+
+// Input 3D texture
+Texture3D<float> _SourceTexture;
+
+// Output buffer
+RWStructuredBuffer<float> _TargetBuffer;
+
+// Dimensions of the texture
+uint _Width;
+uint _Height;
+uint _Depth;
+
+// Offset in the buffer
+int _Offest;
+
+[numthreads(8, 8, 8)] // Adjust thread group size based on your performance needs
+void SerializeTextureToBuffer(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height || id.z >= _Depth)
+        return;
+    int textureIndex = id.x + id.y * _Width + id.z * _Width * _Height;
+
+    float value = _SourceTexture[id];
+
+    int bufferIndex = _Offest + textureIndex;
+
+    _TargetBuffer[bufferIndex] = value;
+}

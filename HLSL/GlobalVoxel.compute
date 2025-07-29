@@ -1,0 +1,353 @@
+#pragma kernel CSGenerateMips
+#pragma kernel VoxelDataCopy
+#pragma kernel VoxelDataReset
+#pragma kernel InputVoxel
+#pragma kernel CopyBufferToRT
+#pragma kernel PropagateUpLODData
+#pragma kernel GenerateGlobalProbe
+#pragma kernel PropagateGlobalProbe
+
+
+#include "RayTrace.hlsl"
+
+RWTexture3D<uint> RG0;
+RWTexture3D<uint> _TempVoxelRTFront;
+RWTexture3D<uint> _TempVoxelRTBack;
+RWTexture3D<uint> _TempVoxelRTNormal;
+RWTexture3D<uint> _TempVoxelRTRadiosityAtlas;
+
+RWTexture3D<uint> _VoxelRTFront;
+RWTexture3D<uint> _VoxelRTBack;
+RWTexture3D<uint> _VoxelRTNormal;
+
+
+RWTexture3D<half4> _VoxelAlbedoFrontRWRT;
+RWTexture3D<float> _VoxelSDFRWRT;
+Texture2D<float4> _InputRT;
+RWTexture3D<float4> Result;
+SamplerState _SamplerInput;
+
+uint _TotalVoxelCount;  
+int _CurrentLevel;
+int _CurrentSlice;
+int _IterationCount;
+int _SourceMip;
+int _DestMip;
+float3 _MoveMotionVector;
+float3 _Offest;
+
+RWStructuredBuffer<GlobalRadiacneProbes> _GlobalRadiacneProbesTemp;
+[numthreads(8, 8, 8)]
+void PropagateGlobalProbe(uint3 id : SV_DispatchThreadID)
+{
+    int levelSize = _BlocksPerAxis * _BlocksPerAxis * _BlocksPerAxis;
+    int3 coord = int3(id.xy, id.z % _BlocksPerAxis);
+    int level = id.z / _BlocksPerAxis;
+
+    int probeIdx = GetGlobalRadiacneProbeIndex(coord, level);
+    GlobalRadiacneProbes probe = _GlobalRadiacneProbesTemp[probeIdx];
+    if (probe.enable == 0)
+    {
+        int3 voxelCoord = coord * _BlockSize;
+        int mipSize = exp2(_BlockLodLevel);
+        int3 mipCoord = voxelCoord / mipSize;
+        int voxelIdx = GetVoxelIndex(level, _BlockLodLevel, mipCoord);
+        GlobalVoxel gv = _VoxelBuffer[voxelIdx];
+
+        if (gv.FullVoxel == 0)
+        {
+            static const int3 dirs[6] =
+            {
+                int3(1, 0, 0), int3(-1, 0, 0),
+                int3(0, 1, 0), int3(0, -1, 0),
+                int3(0, 0, 1), int3(0, 0, -1)
+            };
+            bool canPropagate = false;
+            for (int i = 0; i < 6; i++)
+            {
+                int3 nc = coord + dirs[i];
+                if (any(nc < 0) || any(nc >= _BlocksPerAxis))
+                    continue;
+                GlobalRadiacneProbes np = _GlobalRadiacneProbesTemp[
+                    GetGlobalRadiacneProbeIndex(nc, level)
+                ];
+                if (np.enable == 1)
+                {
+                    canPropagate = true;
+                    break;
+                }
+            }
+            
+            if (canPropagate)
+            {
+                int3 offset = int3(0, 0, 0);
+                bool placed = false;
+                for (int lod = _BlockLodLevel - 1; lod > 0 && !placed; lod--)
+                {
+                    mipSize = exp2(lod);
+                    mipCoord = (int3) floor((float3) (voxelCoord + offset) / (float) mipSize / 2);
+                    for (int dx = 0; dx < 2 && !placed; dx++)
+                        for (int dy = 0; dy < 2 && !placed; dy++)
+                            for (int dz = 0; dz < 2 && !placed; dz++)
+                            {
+                                int3 c = mipCoord + int3(dx, dy, dz);
+                                int idx = GetVoxelIndex(level, lod, c);
+                                GlobalVoxel sub = _VoxelBuffer[idx];
+                                if (sub.AlbedoFront == 0)
+                                {
+                                    placed = true;
+                                }
+                                else if (sub.FullVoxel != 0)
+                                {
+                                    offset = int3(dx, dy, dz) * mipSize;
+                                }
+                            }
+                }
+
+                if (placed)
+                {
+                    probe.enable = 1;
+                    probe.c0 = probe.c1 = probe.c2 = probe.c3 =
+                    probe.c4 = probe.c5 = probe.c6 = probe.c7 = probe.c8 = 0;
+                    probe.worldPos = GetGlobalPosition(
+                        coord * _BlockSize + offset,
+                        level,
+                        0
+                    );
+                    _GlobalRadiacneProbes[probeIdx] = probe;
+                }
+            }
+        }
+    }
+    else
+    {
+        _GlobalRadiacneProbes[probeIdx] = _GlobalRadiacneProbesTemp[probeIdx];
+
+    }
+    
+}
+
+[numthreads(8, 8, 8)]
+void GenerateGlobalProbe(uint3 id : SV_DispatchThreadID)
+{
+    int levelSize = _BlocksPerAxis * _BlocksPerAxis * _BlocksPerAxis;
+    
+    int3 coord = int3(id.xy, id.z % _BlocksPerAxis);
+    int level = floor((float) id.z / (float) _BlocksPerAxis);
+
+    int3 voxelCoord = coord * _BlockSize;
+    int3 probeCoord = int3(0, 0, 0);
+
+    int3 selectVoxelCoord = voxelCoord;
+    
+    
+    int mipSize = exp2(_BlockLodLevel);
+    int3 mipCoord = (int3) floor((float3) voxelCoord / (float) mipSize);
+    int index = GetVoxelIndex(level, _BlockLodLevel, mipCoord);
+    int3 offest = 0;
+    GlobalVoxel globalVoxel = _VoxelBuffer[index];
+    bool enter = false;
+    if (globalVoxel.AlbedoFront != 0 && globalVoxel.FullVoxel == 0)
+    {
+        for (int i = _BlockLodLevel - 1; i > 0; i--)
+        {
+            if (enter)
+            {
+                break;
+            }
+            mipSize = exp2(i);
+            mipCoord = (int3) floor((float3) (voxelCoord + offest) / (float) mipSize / 2);
+            bool selected = false;
+            for (int dx = 0; dx < 2; dx++)
+            {
+                for (int dy = 0; dx < 2; dx++)
+                {
+                    for (int dz = 0; dx < 2; dx++)
+                    {
+                        if (!selected)
+                        {
+                            int3 checkIndex = mipCoord + int3(dx, dy, dz);
+                            index = GetVoxelIndex(level, i, checkIndex);
+                            globalVoxel = _VoxelBuffer[index];
+                            if (globalVoxel.AlbedoFront == 0)
+                            {
+                                selected = true;
+                                enter = true;
+                                break;
+                            }
+                            if (globalVoxel.FullVoxel != 0)
+                            {
+                                offest = int3(dx, dy, dz) * mipSize;
+                                selected = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        
+
+        }
+    }
+    GlobalRadiacneProbes probe;
+    probe.c0 = 0;
+    probe.c1 = 0;
+    probe.c2 = 0;
+    probe.c3 = 0;
+    probe.c4 = 0;
+    probe.c5 = 0;
+    probe.c6 = 0;
+    probe.c7 = 0;
+    probe.c8 = 0;
+    if (enter)
+    {
+        probe.enable = 1;
+        probe.worldPos = GetGlobalPosition(coord * _BlockSize + offest, level, 0);
+    }
+    else
+    {
+        probe.worldPos = 0;
+        probe.enable = 0;
+    }
+
+    _GlobalRadiacneProbesTemp[GetGlobalRadiacneProbeIndex(coord, level)] = probe;
+
+}
+[numthreads(8, 8, 8)]
+void PropagateUpLODData(uint3 id : SV_DispatchThreadID)
+{
+    int3 coord = (int3)_Offest + id.xyz * 2;
+    int3 voxelSize = int3(_VoxelLength, _VoxelLength, _VoxelLength);
+    coord = clamp(coord, (int3) _Offest, voxelSize - (int3)_Offest);
+    int3 upLodCoord = (coord - voxelSize / 2) / 2 + voxelSize / 2;
+    upLodCoord = clamp(upLodCoord, 0, voxelSize);
+    int index = GetVoxelIndex(_CurrentLevel, 0, coord);
+    int upLodIndex = GetVoxelIndex(_CurrentLevel + 1, 0, upLodCoord);
+    GlobalVoxel globalVoxel = _VoxelBuffer[index];
+    GlobalVoxel globalUpLodVoxel = _VoxelBuffer[upLodIndex];
+    uint r = globalVoxel.FinalRadiosityAtlas;
+    globalUpLodVoxel.FinalRadiosityAtlas = r;
+    globalUpLodVoxel.RadiosityAtlas = r;
+    _VoxelBuffer[upLodIndex] = globalUpLodVoxel;
+}
+
+
+[numthreads(8, 8, 8)]
+void VoxelDataCopy(uint3 id : SV_DispatchThreadID)
+{
+
+    int3 coord = int3(id.xyz + (int3) _MoveMotionVector);
+    if (coord.x < 0 || coord.y < 0 || coord.z < 0 ||
+        coord.x >= _VoxelLength || coord.y >= _VoxelLength || coord.z >= _VoxelLength)
+    {
+        _TempVoxelRTFront[id.xyz] = 0;
+        _TempVoxelRTBack[id.xyz] = 0;
+        _TempVoxelRTNormal[id.xyz] = 0;
+        _TempVoxelRTRadiosityAtlas[id.xyz] = 0;
+        return;
+    }
+    
+    int index = GetVoxelIndex(_CurrentLevel, 0, (uint3) coord);
+    GlobalVoxel globalVoxel = _VoxelBuffer[index];
+    _TempVoxelRTFront[id.xyz] = globalVoxel.AlbedoFront;
+    _TempVoxelRTBack[id.xyz] = globalVoxel.AlbedoBack;
+    _TempVoxelRTNormal[id.xyz] = globalVoxel.Normal;
+    _TempVoxelRTRadiosityAtlas[id.xyz] = globalVoxel.RadiosityAtlas;
+    
+
+}
+[numthreads(8, 8, 8)]
+void VoxelDataReset(uint3 id : SV_DispatchThreadID)
+{
+
+    int3 coord = int3(id.xyz + (int3) _Offest);
+    
+    _TempVoxelRTFront[coord] = 0;
+    _TempVoxelRTBack[coord] = 0;
+    _TempVoxelRTNormal[coord] = 0;
+    _TempVoxelRTRadiosityAtlas[coord] = 0;
+
+
+}
+[numthreads(8, 8, 8)]
+void InputVoxel(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VoxelLength || id.y >= _VoxelLength || id.z >= _VoxelLength)
+        return;
+    
+    uint encodedValue0 = _TempVoxelRTFront[id];
+    uint encodedValue1 = _TempVoxelRTBack[id];
+    uint encodedValue2 = _TempVoxelRTNormal[id];
+    uint encodedValue3 = _TempVoxelRTRadiosityAtlas[id];
+    int index = GetVoxelIndex(_CurrentLevel, 0, (uint3) id);
+    GlobalVoxel result;
+
+    result.AlbedoFront = encodedValue0;
+    result.AlbedoBack = encodedValue1;
+    result.Normal = encodedValue2;
+    result.FinalRadiosityAtlas = encodedValue3;
+    result.RadiosityAtlas = encodedValue3;
+    result.FullVoxel = encodedValue2 != 0 ? 1 : 0;
+    _VoxelBuffer[index] = result;
+}
+[numthreads(8, 8, 8)]
+void CSGenerateMips(uint3 id : SV_DispatchThreadID)
+{
+    uint dimDst = (_VoxelLength >> _DestMip);
+    if (id.x >= dimDst || id.y >= dimDst || id.z >= dimDst)
+        return;
+
+
+    int3 dstCoord = int3(id.x, id.y, id.z);
+    int dstIndex = GetVoxelIndex(_CurrentLevel, _DestMip, dstCoord);
+
+
+    int3 srcBase = dstCoord << 1;
+    GlobalVoxel sumVoxel;
+    float4 albedoFront = float4(0, 0, 0, 0);
+    sumVoxel.AlbedoFront = 0;
+    sumVoxel.AlbedoBack = 0;
+    sumVoxel.RadiosityAtlas = 0;
+    sumVoxel.Normal = 0;
+    sumVoxel.FinalRadiosityAtlas = 0;
+    sumVoxel.FullVoxel = 1;
+    float count = 0;
+    for (int oz = 0; oz < 2; oz++)
+    {
+        for (int oy = 0; oy < 2; oy++)
+        {
+            for (int ox = 0; ox < 2; ox++)
+            {
+                int3 scoord = clamp(srcBase + int3(ox, oy, oz), 0, _VoxelLength - 1);
+                int sIndex = GetVoxelIndex(_CurrentLevel, _SourceMip, scoord);
+                GlobalVoxel srcV = _VoxelBuffer[sIndex];
+                albedoFront += DecodeRGBAuint(srcV.AlbedoFront);
+                sumVoxel.RadiosityAtlas += srcV.RadiosityAtlas;
+                sumVoxel.FinalRadiosityAtlas += srcV.FinalRadiosityAtlas;
+                sumVoxel.Normal += srcV.Normal;
+                sumVoxel.FullVoxel *= srcV.FullVoxel;
+                count += (float) sign(abs(albedoFront));
+
+            }
+        }
+    }
+
+    count = max(count, 1);
+    albedoFront /= count;
+    sumVoxel.AlbedoFront = EncodeRGBAuint(albedoFront);
+    sumVoxel.RadiosityAtlas /= count;
+    sumVoxel.FinalRadiosityAtlas = 0;
+    sumVoxel.Normal /= count;
+    _VoxelBuffer[dstIndex] = sumVoxel;
+}
+ 
+[numthreads(8, 8, 8)]
+void CopyBufferToRT(uint3 id : SV_DispatchThreadID)
+{
+    uint level = id.z / _VoxelLength;
+    uint3 coord = uint3(id.xy, id.z % _VoxelLength);
+
+    float lodSize = _VoxelSize * pow(2, level);
+    int voxelIndex = GetVoxelIndex(level, 0, coord);
+    _VoxelAlbedoFrontRWRT[id] = DecodeRGBAuint(_VoxelBuffer[voxelIndex].AlbedoFront);
+}

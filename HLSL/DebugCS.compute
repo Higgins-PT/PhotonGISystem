@@ -1,0 +1,41 @@
+
+#pragma kernel CopyBuffer
+#pragma kernel Custom
+ByteAddressBuffer InputData;
+
+RWTexture2D<float4> Result;
+uint _Width;
+uint _Height;
+
+uint Stride;
+uint FieldOffset;
+uint FieldCount; 
+uint Count; 
+uint Width;
+[numthreads(8, 8, 1)]
+void CopyBuffer(uint3 id : SV_DispatchThreadID)
+{
+    uint x = id.x;
+    uint y = id.y;
+    uint idx = y * Width + x;
+    if (idx >= Count) 
+        return;
+    uint baseAddr = idx * Stride + FieldOffset;
+
+    float4 value = (float4) 0.0;
+
+    [unroll]
+    for (uint i = 0; i < FieldCount; ++i)
+    {
+        uint raw = InputData.Load(baseAddr + i * 4);
+        value[i] = asfloat(raw);
+    }
+
+    Result[id.xy] = value;
+}
+[numthreads(8, 8, 1)]
+void Custom(uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (float2) id.xy / float2(_Width, _Height);
+    Result[id.xy] = float4(uv, 0, 0);
+}

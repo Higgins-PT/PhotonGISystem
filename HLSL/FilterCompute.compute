@@ -1,0 +1,669 @@
+﻿
+#pragma kernel TemporalFilter
+#pragma kernel AtrousFilter
+
+#pragma kernel WALR_Init
+#pragma kernel WALR_Atrous
+#pragma kernel WALR_Solve
+
+#pragma kernel CopyRT_Float2ToFloat2
+#pragma kernel CopyRT_Float4ToFloat3
+#pragma kernel CopyBuff_Float3ToFloat4
+
+RWTexture2D<float4> _HistoryColorRT;
+RWTexture2D<float4> _HistoryNormalDepthRT;
+RWTexture2D<float> _VarianceRT;
+RWTexture2D<float4> _RadianceRT; 
+RWTexture2D<float4> _TargetRT; 
+RWTexture2D<float> _AORT;
+Texture2D<float2> _MotionVectorRT;
+Texture2D<float> _DepthRT;
+Texture2D<float4> _NormalRT;
+float _ClampSigma;
+float _AlphaColor;
+float _AlphaVar;
+int _StepSize;
+float _StepSizeWeight;
+float2 _MotionToRTScale;
+
+int _EnableAO;
+
+int2 _AORTSize;
+float _PhiNormal;
+float _PhiColor;
+float4 _ZBufferParams;
+float _PhiDepthStart;
+float _PhiSpatial;
+
+float _PhiDepthScale;
+float4x4 _ProjectionMatrix;
+float4x4 _ViewMatrix;
+float4x4 _ProjectionMatrixInverse;
+float4x4 _ViewMatrixInverse;
+RWTexture2D<float4> _SrcRTRW;
+Texture2D<float4> _SrcRT;
+Texture2D<float4> _SrcRT2;
+RWStructuredBuffer<float2> _DstBuf2;
+RWStructuredBuffer<float3> _DstBuf;
+int _ScreenWidth;
+int _ScreenHeight;
+float _CopyScale;
+float CalcRadiance(float3 color)
+{
+    return dot(color, float3(0.2126, 0.7152, 0.0722));
+}
+inline float LinearEyeDepth(float z)
+{
+    return 1.0 / (_ZBufferParams.z * z + _ZBufferParams.w);
+}
+float4 TemporalBlend(float4 historyColor, float4 currentColor, float variance)
+{
+    float colorDiff = saturate(length(currentColor.xyz - historyColor.xyz));
+    float diffWeight = saturate(1 / max(colorDiff, 0.001));
+    float varianceWeight = 1.0 / (1.0 + variance);
+
+    float finalWeight = diffWeight * varianceWeight;
+
+    finalWeight = saturate(finalWeight);
+
+    return lerp(historyColor, currentColor, finalWeight);
+}
+float3 ReconstructViewPos(float2 uv, float depth01)
+{
+    float4 clipPos;
+    clipPos.xy = uv * 2.0f - 1.0f;
+    clipPos.z = depth01 * 2.0f - 1.0f;
+    clipPos.w = 1.0f;
+
+    float4 viewPosH = mul(_ProjectionMatrixInverse, clipPos);
+
+    return viewPosH.xyz / viewPosH.w;
+}
+
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------TemporalFilter
+//----------------------------------------------------------------------------
+#define SAFEVALUE 10
+[numthreads(8, 8, 1)]
+void TemporalFilter(uint3 id : SV_DispatchThreadID)
+{
+    uint2 uv = id.xy;
+    float2 mv = round(_MotionVectorRT[uv * _MotionToRTScale].xy * float2(_ScreenWidth, _ScreenHeight));
+    int2 prevUV = (int2) uv - (int2) mv;
+
+    if (!all((prevUV >= int2(1, 1)) & (prevUV < int2(_ScreenWidth - 1, _ScreenHeight - 1))))
+    {
+        _TargetRT[uv] = clamp(_RadianceRT[uv], 0, SAFEVALUE);
+        _HistoryNormalDepthRT[uv] = float4(normalize(_NormalRT[uv * _MotionToRTScale].xyz), _DepthRT[uv * _MotionToRTScale]);
+        _VarianceRT[uv] = 0;
+        return;
+    }
+
+    float4 historyColor = _HistoryColorRT[prevUV];
+    float4 currentColor = _RadianceRT[uv];
+    float oldVar = _VarianceRT[prevUV];
+
+    float currDepth = _DepthRT[uv * _MotionToRTScale], prevDepth = _HistoryNormalDepthRT[uv].a;
+    float3 currNorm = normalize(_NormalRT[uv * _MotionToRTScale].xyz), prevNorm = normalize(_HistoryNormalDepthRT[uv].xyz);
+    if (abs(prevDepth - currDepth) > 0.03 || dot(currNorm, prevNorm) < 0.8)
+    {
+        _TargetRT[uv] = clamp(currentColor, 0, SAFEVALUE);
+        _HistoryNormalDepthRT[uv] = float4(currNorm, currDepth);
+        _VarianceRT[uv] = 0;
+        return;
+    }
+
+    float currLum = CalcRadiance(currentColor.xyz);
+    float prevLum = CalcRadiance(historyColor.xyz);
+    float sigma = sqrt(max(oldVar, 1e-6));
+    float th = _ClampSigma * sigma;
+    float newLum = clamp(currLum, prevLum - th, prevLum + th);
+
+    float currA = currentColor.a;
+    float prevA = historyColor.a;
+    float newA = clamp(currA, prevA - th, prevA + th);
+
+    float3 adjRGB = currentColor.xyz;
+    if (currLum > 0.05) 
+        adjRGB *= (newLum / currLum);
+
+    float3 outRGB = lerp(historyColor.xyz, adjRGB, _AlphaColor);
+    float outA = lerp(prevA, newA, _AlphaColor);
+
+    float4 finColor = clamp(float4(outRGB, outA), 0, SAFEVALUE);
+    _TargetRT[uv] = finColor;
+
+    _HistoryNormalDepthRT[uv] = float4(currNorm, currDepth);
+    float dv = currLum - prevLum;
+    float var = lerp(oldVar, min(dv * dv, SAFEVALUE), _AlphaVar);
+    _VarianceRT[uv] = max(var, 1e-6);
+}
+
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------AtrousFilter
+//----------------------------------------------------------------------------
+float GetAO(uint2 id)
+{
+    float2 uv = (float2) id / float2(_ScreenWidth, _ScreenHeight);
+    uint2 index = (int2)round(uv * (float2) _AORTSize);
+    return _AORT[index];
+}
+
+[numthreads(8, 8, 1)]
+void AtrousFilter(uint3 id : SV_DispatchThreadID)
+{
+    uint2 uv = id.xy;
+    float4 center = _RadianceRT[uv];
+    float centerDepth = LinearEyeDepth(_DepthRT[uv * _MotionToRTScale]);
+    float3 centerNorm = _NormalRT[uv * _MotionToRTScale].xyz;
+    float var = _VarianceRT[uv];
+    float dynPhi = _PhiDepthStart + _PhiDepthScale * centerDepth;
+    float ao = (_EnableAO == 1) ? GetAO(uv) : 1.0;
+
+    float4 sumRGBA = center.xyzw;
+    float sumW = 1.0;
+    int hk = 1;
+
+    [unroll]
+    for (int oy = -hk; oy <= hk; ++oy)
+    {
+        [unroll]
+        for (int ox = -hk; ox <= hk; ++ox)
+        {
+            int2 nUV = int2(uv.x + ox * _StepSize, uv.y + oy * _StepSize);
+            if (nUV.x < 0 || nUV.x >= _ScreenWidth || nUV.y < 0 || nUV.y >= _ScreenHeight)
+                continue;
+
+            float4 nc = _RadianceRT[nUV];
+            float nd = LinearEyeDepth(_DepthRT[nUV * _MotionToRTScale]);
+            float3 nn = _NormalRT[nUV * _MotionToRTScale].xyz;
+
+            float dd = abs(centerDepth - nd);
+            float wd = exp(-dd * dd / (dynPhi * dynPhi));
+
+            float ndot = max(0, 1 - dot(centerNorm, nn));
+            float wn = exp(-ndot / _PhiNormal);
+            float phi_color_var = _PhiColor * sqrt(max(1, 1e-6));
+            float lumN = saturate(CalcRadiance(nc.xyz));
+            float wc = exp(-(ao - lumN) / (phi_color_var * phi_color_var + 1e-6));
+
+            float w = wd * wn * wc * _StepSizeWeight;
+            sumRGBA += nc * w;
+            sumW += w;
+        }
+    }
+
+    float4 outRGBA = sumRGBA / sumW;
+
+    _TargetRT[uv] = outRGBA;
+}
+
+#define IDX(i,j) ((i)*((i) + 1u)/2u + (j))
+#define RCI(row,col)    ((row)*3 + (col)) 
+void Cholesky5(in half XX[15], out half C[15])
+{
+    float Ct[15];
+    [unroll]
+    for (uint t = 0; t < 15; ++t)
+        Ct[t] = 0.0f;
+    const float EPS = 3e-4f;
+
+    [unroll]
+    for (uint i = 0; i < 5; ++i)
+    {
+        float cii = (float) XX[IDX(i, i)]; //𝐶𝑖,𝑖←𝑋𝑋ii
+
+        [unroll]
+        for (uint j = 0; j < i; ++j) 
+        {
+            float cij = Ct[IDX(i, j)]; //𝐶𝑖,𝑖←𝐶𝑖,𝑖−𝐶𝑖,𝑗𝐶𝑖,𝑗
+            cii -= cij * cij;
+        }
+
+        cii = sqrt(max(cii, EPS));
+        Ct[IDX(i, i)] = cii; //𝐶𝑖,𝑖←√︁𝑚𝑎𝑥(𝐶𝑖,𝑖,𝜖𝑖)
+
+        [unroll]
+        for (uint jt = i + 1; jt < 5; ++jt) 
+        {
+            float cji = (float) XX[IDX(jt, i)];
+
+            [unroll]
+            for (uint k = 0; k < i; ++k)  
+                cji -= Ct[IDX(jt, k)] * Ct[IDX(i, k)];
+
+            Ct[IDX(jt, i)] = cji / cii; //𝐶𝑗,𝑖←𝐶𝑗,𝑖/𝐶𝑖,i
+        }
+    }
+
+    [unroll]
+    for (uint tr = 0; tr < 15; ++tr)
+        C[tr] = (half) Ct[tr];
+}
+void Forward5x3(in half L[15], in half YX[15], out half F[15])
+{
+    float Ft[15];
+
+    [unroll]
+    for (uint r = 0; r < 5; ++r) 
+    {
+        [unroll]
+        for (uint c = 0; c < 3; ++c) 
+        {
+            float sum = (float) YX[RCI(r, c)];
+
+            [unroll]
+            for (uint j = 0; j < r; ++j)    
+                sum -= (float) L[IDX(r, j)] * Ft[RCI(j, c)];
+
+            Ft[RCI(r, c)] = sum / (float) L[IDX(r, r)];
+        }
+    }
+
+    [unroll]
+    for (uint k = 0; k < 15; ++k)
+        F[k] = (half) Ft[k];
+}
+void Backward5x3(in half L[15], in half F[15], out half X[15])
+{
+    float Xt[15];
+    for (int j = 4; j >= 0; --j)
+    {
+        [unroll]
+        for (uint c = 0; c < 3; ++c)
+        {
+            float sum = (float) F[RCI(j, c)];
+
+            [unroll]
+            for (uint i = j + 1; i < 5; ++i) 
+                sum -= (float) L[IDX(i, j)] * Xt[RCI(i, c)];
+
+            Xt[RCI(j, c)] = sum / (float) L[IDX(j, j)];
+        }
+    }
+
+    [unroll]
+    for (uint k = 0; k < 15; ++k)
+        X[k] = (half) Xt[k];
+}
+
+
+float ComputeAtrousEdgeWeight(float3 centerN, float3 viewPos, float3 neighN, float3 viewPosN) //𝑓(𝑥,𝑦,𝑢,𝑣)=h𝑡(𝑢)h𝑡(𝑣)𝑤(𝑥,𝑦,𝑥+𝑢,𝑦+𝑣),
+{
+    const float sigmaPos = 0.03f; // m
+    const float cosTheta = 0.94f; // ≈ 20°
+    float wPos = saturate(1.0 - abs(dot(viewPosN - viewPos, centerN)) / sigmaPos);
+    float wNorm = saturate((dot(centerN, neighN) - cosTheta) / (1.0 - cosTheta));
+    float w = wPos * wNorm;
+
+    return w;
+}
+float3 ReconstructWorldPos(float2 uv, float depth01)
+{
+    float3 viewPos = ReconstructViewPos(uv, depth01);
+    return mul(_ViewMatrixInverse, float4(viewPos, 1.0f)).xyz;
+}
+float4 PackTwoHalf4(half4 a, half4 b)
+{
+    uint u0 = f32tof16((float) a.x) | (f32tof16((float) a.y) << 16);
+    uint u1 = f32tof16((float) a.z) | (f32tof16((float) a.w) << 16);
+    uint u2 = f32tof16((float) b.x) | (f32tof16((float) b.y) << 16);
+    uint u3 = f32tof16((float) b.z) | (f32tof16((float) b.w) << 16);
+    return asfloat(uint4(u0, u1, u2, u3));
+}
+void UnpackTwoHalf4(float4 packed, out half4 a, out half4 b)
+{
+    uint4 u = asuint(packed);
+
+    a = half4(
+        f16tof32(u.x & 0xFFFF),
+        f16tof32(u.x >> 16),
+        f16tof32(u.y & 0xFFFF),
+        f16tof32(u.y >> 16));
+
+    b = half4(
+        f16tof32(u.z & 0xFFFF),
+        f16tof32(u.z >> 16),
+        f16tof32(u.w & 0xFFFF),
+        f16tof32(u.w >> 16));
+}
+
+float2 EncodeNormal_Oct(float3 n)
+{
+
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 e = n.xy;
+    if (n.z < 0)
+        e = (1.0 - abs(e.yx)) * sign(e);
+    return e;
+}
+RWTexture2D<float4> _XXBuffer1S;
+RWTexture2D<float4> _XXBuffer2S;
+RWTexture2D<float4> _XYBuffer1S;
+RWTexture2D<float4> _XYBuffer2S;
+RWTexture2D<float4> _XXBuffer1L;
+RWTexture2D<float4> _XXBuffer2L;
+RWTexture2D<float4> _XYBuffer1L;
+RWTexture2D<float4> _XYBuffer2L;
+
+static const uint kCount = 16;
+static const uint kHalfCount = 15;
+static const uint kSlotCount = 8;
+
+float4 Pack8Half(in half src[kSlotCount], uint start)
+{
+    half4 a = half4(src[start + 0], src[start + 1], src[start + 2], src[start + 3]);
+    half4 b = half4(src[start + 4], src[start + 5], src[start + 6], src[start + 7]);
+    return PackTwoHalf4(a, b);
+}
+void Unpack8Half(float4 packed, inout half dst[kCount], uint start)
+{
+    half4 a, b;
+    UnpackTwoHalf4(packed, a, b); 
+
+    dst[start + 0] = a.x;
+    dst[start + 1] = a.y;
+    dst[start + 2] = a.z;
+    dst[start + 3] = a.w;
+    dst[start + 4] = b.x;
+    dst[start + 5] = b.y;
+    dst[start + 6] = b.z;
+    dst[start + 7] = b.w;
+}
+void StoreXXHalf15(uint2 uv, in half data[kHalfCount], half weight)
+{
+
+    half tmp0[kSlotCount];
+    half tmp1[kSlotCount];
+    [unroll]
+    for (uint i = 0; i < 8; ++i)
+        tmp0[i] = data[i];
+        [unroll]
+    for (uint j = 0; j < 7; ++j)
+        tmp1[j] = data[j + 8];
+    tmp1[7] = weight;
+    _XXBuffer1S[uv] = Pack8Half(tmp0, 0);
+    _XXBuffer2S[uv] = Pack8Half(tmp1, 0);
+}
+
+
+void LoadXXHalf15(uint2 uv, out half dst[kHalfCount], out half weight)
+{
+    half tmp[kCount];
+    Unpack8Half(_XXBuffer1L[uv], tmp, 0);
+    Unpack8Half(_XXBuffer2L[uv], tmp, 8);
+        [unroll]
+    for (uint i = 0; i < 15; ++i)
+        dst[i] = tmp[i];
+    weight = tmp[15];
+}
+
+void StoreXYHalf15(uint2 uv, in half data[kHalfCount], half weight)
+{
+    half tmp0[kSlotCount];
+    half tmp1[kSlotCount];
+    [unroll]
+    for (uint i = 0; i < 8; ++i)
+        tmp0[i] = data[i];
+    [unroll]
+    for (uint j = 0; j < 7; ++j)
+        tmp1[j] = data[j + 8];
+    tmp1[7] = weight;
+    _XYBuffer1S[uv] = Pack8Half(tmp0, 0);
+    _XYBuffer2S[uv] = Pack8Half(tmp1, 0);
+}
+
+void LoadXYHalf15(uint2 uv, out half dst[kHalfCount], out half weight)
+{
+    half tmp[kCount];
+
+    Unpack8Half(_XYBuffer1L[uv], tmp, 0);
+    Unpack8Half(_XYBuffer2L[uv], tmp, 8);
+    [unroll]
+    for (uint i = 0; i < 15; ++i)
+        dst[i] = tmp[i];
+    weight = tmp[15];
+}
+void GetFV(out half X[5], uint2 uv)
+{
+    float originDepth = _DepthRT[uv * _MotionToRTScale];
+    float3 N = normalize(_NormalRT[uv * _MotionToRTScale].xyz);
+    float2 n2 = EncodeNormal_Oct(N);
+    uint2 iUV = uint2(_ScreenWidth, _ScreenHeight);
+    float2 uv01 = (float2) uv / (float2) iUV;
+    float3 viewPos = ReconstructViewPos(uv01, originDepth);
+    float3 worldPos = mul(_ViewMatrixInverse, float4(viewPos, 1.0f)).xyz;
+
+    /*
+    X[0] = 1.0;
+    X[1] = worldPos.x / 1000;
+    X[2] = worldPos.z / 1000;
+    X[3] = n2.x;
+    X[4] = n2.y;
+*/
+    X[0] = 1.0;
+    X[1] = uv01;
+    X[2] = uv01;
+    X[3] = 1;
+    X[4] = 1;
+}
+
+[numthreads(8, 8, 1)]
+void WALR_Init(uint3 id : SV_DispatchThreadID)
+{
+    uint2 uv = id.xy;
+
+    float3 N = normalize(_NormalRT[uv * _MotionToRTScale].xyz);
+    half3 color = (half3)_RadianceRT[uv].xyz;
+    float2 n2 = EncodeNormal_Oct(N);
+    //X = {1, uv.x, uv.y, n.x, n.y}
+    half X[5];
+    GetFV(X, uv);
+    half XX[15];
+    half YX[15];
+    uint k = 0;
+    [unroll]
+    for (uint i = 0; i < 5; ++i)
+    {
+        [unroll]
+        for (uint j = 0; j <= i; ++j)
+        {
+            XX[IDX(i, j)] = X[i] * X[j];
+        }
+    }
+    k = 0;
+    half colorA[3] = { color.x, color.y, color.z };
+    [unroll]
+    for (uint iy = 0; iy < 5; iy++)
+    {
+        
+        [unroll]
+        for (uint jy = 0; jy < 3; jy++)
+        {
+            YX[RCI(iy, jy)] = colorA[jy] * X[iy];
+        }
+    }
+    
+    //𝑊0(𝑥,𝑦)=1
+    StoreXXHalf15(uv, XX, 1); //𝑋𝑋𝑖,𝑗,0(𝑥,𝑦)=𝑋𝑖(𝑥,𝑦)𝑋𝑗(𝑥,𝑦)
+    StoreXYHalf15(uv, YX, 1); //𝑌𝑋𝑖,0(𝑥,𝑦)=𝑌(𝑥,𝑦)𝑋𝑖(𝑥,𝑦)
+}
+
+[numthreads(8, 8, 1)]
+void WALR_Atrous(uint3 id : SV_DispatchThreadID)
+{
+    uint2 uv = id.xy;
+    float4 center = _RadianceRT[uv];
+    float originDepth = _DepthRT[uv * _MotionToRTScale];
+    uint2 iUV = uint2(_ScreenWidth, _ScreenHeight);
+    float3 viewPos = ReconstructViewPos((float2) uv / (float2) iUV, originDepth);
+    float3 worldPos = mul(_ViewMatrixInverse, float4(viewPos, 1.0f)).xyz;
+    float centerDepth = LinearEyeDepth(originDepth);
+    float3 centerNorm = _NormalRT[uv * _MotionToRTScale].xyz;
+
+    float sumW = 0.0;
+    //X = {1, uv.x, uv.y, n.x, n.y}
+    half xxSumW[15];
+    half yxSumW[15];
+    [unroll]
+    for (int i = 0; i < 15; i++)
+    {
+        xxSumW[i] = 0;
+        yxSumW[i] = 0;
+
+    }
+    int hk = 1;
+    [unroll]
+    for (int oy = -hk; oy <= hk; ++oy)
+    {
+        [unroll]
+        for (int ox = -hk; ox <= hk; ++ox)
+        {
+            int2 nUV = int2(uv.x + ox * _StepSize, uv.y + oy * _StepSize);
+            nUV = clamp(nUV, int2(0, 0), int2(_ScreenWidth - 1, _ScreenHeight - 1));
+            float weight = 1;
+            
+            float depthN = LinearEyeDepth(_DepthRT[nUV * _MotionToRTScale]);
+            float3 neighN = _NormalRT[nUV * _MotionToRTScale].xyz;
+            float3 viewPosN = ReconstructViewPos((float2) nUV / (float2) iUV, centerDepth);
+            float3 worldPosN = mul(_ViewMatrixInverse, float4(viewPos, 1.0f)).xyz;
+            float f = max(ComputeAtrousEdgeWeight(centerNorm, worldPos, neighN, worldPosN), 0);
+            half xx[15] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+            if (f == 0)
+            {
+                continue;
+            }
+            float wN;
+            LoadXXHalf15(nUV, xx, weight);
+            half yx[15] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+            LoadXYHalf15(nUV, yx, wN);
+            weight *= f;
+            [unroll]
+            for (int i = 0; i < 15; i++)
+            {
+                xxSumW[i] += xx[i] * weight;
+                yxSumW[i] += yx[i] * weight;
+            }
+            
+            
+            sumW += weight;
+
+        }
+    }
+    
+    sumW = max(sumW, 0.000001);
+    [unroll]
+    for (int j = 0; j < 15; j++)
+    {
+        xxSumW[j] /= sumW;
+        yxSumW[j] /= sumW;
+    }
+    StoreXXHalf15(uv, xxSumW, sumW); //𝑋𝑋𝑖,𝑗,0(𝑥,𝑦)=𝑋𝑖(𝑥,𝑦)𝑋𝑗(𝑥,𝑦)
+    StoreXYHalf15(uv, yxSumW, sumW); //𝑌𝑋𝑖,0(𝑥,𝑦)=𝑌(𝑥,𝑦)𝑋𝑖(𝑥,𝑦)
+
+}
+void ScatterBeta15To3x5(in half src[15], out half3 dst[5])
+{
+    [unroll]
+    for (int k = 0; k < 5; ++k)
+    {
+
+        dst[k] = half3(src[RCI(k, 0)],
+                       src[RCI(k, 1)],
+                       src[RCI(k, 2)]);
+    }
+}
+
+
+float ValidateCholesky(in half XX[15], in half C[15])
+{
+    const uint N = 5;
+    float err = 0.0;
+    float normA = 0.0;
+
+    [loop]
+    for (uint i = 0; i < N; ++i)
+    {
+        [loop]
+        for (uint j = 0; j <= i; ++j)
+        {
+            float a = XX[IDX(i, j)];
+
+            float llT = 0.0;
+            [unroll] 
+            for (uint k = 0; k <= j; ++k)
+            {
+                llT += C[IDX(i, k)] * C[IDX(j, k)];
+            }
+
+            float diff = a - llT;
+            err += diff * diff;
+            normA += a * a;
+        }
+    }
+
+    normA = max(normA, 1e-20);
+
+    return sqrt(err / normA);
+}
+[numthreads(8, 8, 1)]
+void WALR_Solve(uint3 id : SV_DispatchThreadID)
+{
+    uint2 uv = id.xy;
+    half xx[15];
+    half yx[15];
+    float weight;
+    float wN;
+    LoadXXHalf15(uv, xx, weight);
+    LoadXYHalf15(uv, yx, wN);
+    half C[15];
+    half F[15];
+    half B[15];
+    half3 Beta[5];
+
+    Cholesky5(xx, C);
+    Forward5x3(C, yx, F);
+    Backward5x3(C, F, B);
+    ScatterBeta15To3x5(B, Beta);
+    float3 N = normalize(_NormalRT[uv * _MotionToRTScale].xyz);
+    float4 r = _RadianceRT[uv];
+    half3 color = (half3) r.xyz;
+    float2 n2 = EncodeNormal_Oct(N);
+    //X = {1, uv.x, uv.y, n.x, n.y}
+    half X[5];
+    GetFV(X, uv);
+    half3 Yhat = float3(0, 0, 0);
+    float3 error = r.xyz;
+    [unroll]
+    for (int k = 0; k < 5; ++k)
+        Yhat += Beta[k] * X[k];
+    error -= Yhat;
+    _TargetRT[uv] = float4((float3) Yhat, r.w);
+
+
+}
+[numthreads(8, 8, 1)]
+void CopyRT_Float2ToFloat2(uint3 id : SV_DispatchThreadID)
+{
+    uint2 uv = id.xy;
+    float2 c = _SrcRT2[floor((float2) uv / _CopyScale)];
+    uint index = uv.y * _ScreenWidth + uv.x;
+    _DstBuf2[index] = c;
+
+}
+[numthreads(8, 8, 1)]
+void CopyRT_Float4ToFloat3(uint3 id : SV_DispatchThreadID)
+{
+    uint2 uv = id.xy;
+    float4 c = _SrcRT[floor((float2) uv / _CopyScale)];
+    uint index = uv.y * _ScreenWidth + uv.x;
+    _DstBuf[index] = c;
+
+}
+[numthreads(64, 1, 1)]
+void CopyBuff_Float3ToFloat4(uint3 id : SV_DispatchThreadID)
+{
+    float4 c = float4(_DstBuf[id.x], 1);
+    uint2 index = uint2(id.x % _ScreenWidth, id.x / _ScreenWidth);
+    _SrcRTRW[index] = c;
+}

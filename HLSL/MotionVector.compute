@@ -1,0 +1,98 @@
+#pragma kernel GenerateMotionVector
+
+cbuffer MVParams
+{
+    float _ScreenWidth;
+    float _ScreenHeight;
+    uint _CascadeStride;
+    int _CascadeStrideHalf;
+    float _PhiDepthStart;
+    float _PhiDepthScale;
+    float _PhiNormal;
+    float4x4 _PrevVP; 
+    float4x4 _CurrInvVP;
+};
+
+Texture2D<float4> _HistoryNormalDepthRT;
+Texture2D<float> _DepthRT;
+Texture2D<float4> _NormalRT;
+
+RWTexture2D<float2> _MotionVectorRT;
+float4 _ZBufferParams;
+
+float2 ReprojectPixel(int2 pixelCoord)
+{
+
+    float2 ndc;
+    ndc.x = (((float) pixelCoord.x) / _ScreenWidth) * 2.0 - 1.0;
+    ndc.y = (((float) pixelCoord.y) / _ScreenHeight) * 2.0 - 1.0;
+    float4 currClip = float4(ndc, 1, 1);
+
+    float4 worldPos = mul(_CurrInvVP, currClip);
+    worldPos /= worldPos.w;
+
+    float4 prevClip = mul(_PrevVP, worldPos);
+    prevClip /= prevClip.w;
+    float2 currScreen;
+    currScreen.x = (prevClip.x * 0.5 + 0.5) * _ScreenWidth;
+    currScreen.y = (prevClip.y * 0.5 + 0.5) * _ScreenHeight;
+    return currScreen;
+}
+inline float LinearEyeDepth(float z)
+{
+    return 1.0 / (_ZBufferParams.z * z + _ZBufferParams.w);
+}
+float ComputeCost(int2 candidateCoord, float centerDepth, float3 centerNorm, out float candidateDepth, out float3 candidateNorm)
+{
+    candidateDepth = LinearEyeDepth(_HistoryNormalDepthRT[candidateCoord].w);
+    candidateNorm = normalize(_HistoryNormalDepthRT[candidateCoord].xyz);
+    float dynamicPhiDepth = _PhiDepthStart + _PhiDepthScale * centerDepth;
+    float depthDiff = abs(centerDepth - candidateDepth);
+    float costDepth = (depthDiff * depthDiff) / (dynamicPhiDepth * dynamicPhiDepth + 1e-6);
+    float dotVal = saturate(dot(centerNorm, candidateNorm));
+    float costNormal = (1.0 - dotVal) / _PhiNormal;
+    return costDepth * costNormal;
+}
+
+[numthreads(8, 8, 1)]
+void GenerateMotionVector(uint3 id : SV_DispatchThreadID)
+{
+
+    int2 outCoord = int2((int2)id.xy);
+
+    
+    int2 fullCoord = outCoord * _CascadeStride;
+    int2 cellCenter = fullCoord + int2(_CascadeStrideHalf, _CascadeStrideHalf);
+    cellCenter.x = clamp(cellCenter.x, 0, _ScreenWidth - 1);
+    cellCenter.y = clamp(cellCenter.y, 0, _ScreenHeight - 1);
+    
+    float centerDepth = LinearEyeDepth(_DepthRT[cellCenter]);
+    float2 reprojectedPos = ReprojectPixel(cellCenter);
+    int2 baseCoord = int2(round(reprojectedPos));
+    baseCoord.x = clamp(baseCoord.x, 0, _ScreenWidth - 1);
+    baseCoord.y = clamp(baseCoord.y, 0, _ScreenHeight - 1);
+    
+    float3 centerNorm = normalize(_NormalRT[cellCenter].xyz);
+    
+    float bestCost = 1e10;
+    int2 bestCoord = baseCoord;
+    for (int oy = -1; oy <= 1; oy++)
+    {
+        for (int ox = -1; ox <= 1; ox++)
+        {
+            int2 candidate = baseCoord + int2(ox, oy) * _CascadeStride;
+            float candidateDepth;
+            float3 candidateNorm;
+            float cost = ComputeCost(candidate, centerDepth, centerNorm, candidateDepth, candidateNorm);
+            if (cost < bestCost)
+            {
+                bestCost = cost;
+                bestCoord = candidate;
+            }
+        }
+    }
+    
+
+    int2 motionInt = (baseCoord / _CascadeStride) - outCoord;
+    _MotionVectorRT[outCoord] = float2((float2)motionInt);
+}

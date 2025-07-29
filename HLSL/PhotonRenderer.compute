@@ -1,0 +1,532 @@
+﻿
+#pragma kernel RenderLocalSDFDebug
+#pragma kernel TemporalReuse
+#pragma kernel HistoryFeedBack
+#pragma kernel SpatialReuse
+#pragma kernel OutputReSTIR
+#pragma kernel SSRTest
+#pragma kernel BlitToActive
+#pragma kernel GlobalVoxelTest
+#pragma kernel GlobalVoxelGI
+#pragma kernel OutputColor
+#pragma target 5.1
+#pragma require logicOp
+
+#include "SSR.hlsl"
+#include "RayTrace.hlsl"
+
+float3 _LightNormal;
+RWTexture2D<float4> _ResultTarget;
+RWTexture2D<float4> _TempBuffer;
+Texture2D<float4> _DepthTexture;
+Texture2D<float4> _NormalTexture;
+Texture2D<float4> _ActiveTexture;
+Texture2D<float4> _LumResult;
+
+TextureCube<float4> _SkyBox;
+int _ScreenWidth;
+int _ScreenHeight;
+SamplerState sampler_SkyBox;
+int _SPP;
+int _MaxBounces;
+float3 SampleSkybox(float3 direction)
+{
+    return float3(0.05, 0.1, 0.2);
+    return _SkyBox.Sample(sampler_SkyBox, direction).xyz;
+}
+
+float3 LambertShading(float3 normal, float3 lightDir, float3 baseColor)
+{
+    float NdotL = max(0, dot(normal, lightDir) * 0.5 + 0.5);
+    return baseColor * NdotL;
+}
+void BuildOrthonormalBasis(float3 n, out float3 t, out float3 b)
+{
+    if (abs(n.z) < 0.999f)
+    {
+        t = normalize(cross(n, float3(0, 0, 1)));
+    }
+    else
+    {
+        t = normalize(cross(n, float3(1, 0, 0)));
+    }
+    b = cross(n, t);
+}
+
+float3 ToWorldDir(float3 localDir, float3 n, float3 t, float3 b)
+{
+    return localDir.x * t + localDir.y * b + localDir.z * n;
+}
+uint Hash(uint x)
+{
+    x ^= (x << 13);
+    x ^= (x >> 17);
+    x ^= (x << 5);
+    return x;
+}
+float Rand(uint seed)
+{
+    return (Hash(seed) & 0x00FFFFFF) / 16777216.0;
+}
+
+float Radians(float degrees)
+{
+    return degrees * (PI / 180.0);
+}
+
+
+float3 SampleConeDirection(float3 normal, float coneAngle, float2 randVal)
+{
+
+    float angleRad = Radians(coneAngle);
+    float cosMax = cos(angleRad);
+
+
+    float cosTheta = lerp(1.0, cosMax, randVal.x);
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+    float phi = 2.0 * PI * randVal.y;
+
+    float3 w = normalize(normal);
+
+    float3 up = (abs(w.z) < 0.999f) ? float3(0, 0, 1) : float3(0, 1, 0);
+
+    float3 u = normalize(cross(up, w));
+    float3 v = cross(w, u);
+
+
+    float3 dir = u * (cos(phi) * sinTheta)
+               + v * (sin(phi) * sinTheta)
+               + w * cosTheta;  
+
+    return normalize(dir);
+}
+float3 GetNormal(uint2 uv)
+{
+    return _NormalTexture[uv].xyz;
+
+}
+
+
+
+
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+//----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+struct RaySample
+{
+    float3 radiance;
+    float pdf;
+    float3 pos;
+    float3 path;
+    float3 endNormal;
+};
+struct ReservoirSample
+{
+    RaySample selected;
+    float weightSum;
+    float eWeight;
+    uint count;
+    
+};
+RWStructuredBuffer<ReservoirSample> _ReservoirBuffer;
+RWStructuredBuffer<ReservoirSample> _HistoryBuffer;
+RWStructuredBuffer<ReservoirSample> _TemporalReservoir;
+
+uint GetBufferIndex(int2 index)
+{
+    return index.x + index.y * _ScreenWidth;
+
+}
+float ComputeLuminance(float3 color)
+{
+    float3 luminanceCoeff = float3(0.2126, 0.7152, 0.0722);
+    float luminance = dot(color, luminanceCoeff);
+    return luminance;
+}
+void MergeReservoir(inout ReservoirSample sourceRS, ReservoirSample otherRS, float4 seed)
+{
+    float random = saturate(FastHash(seed));
+    float w = sourceRS.weightSum;
+    float newW = otherRS.weightSum;
+    if ((w + newW) == 0)
+    {
+        sourceRS.count += otherRS.count;
+        sourceRS.weightSum = 0;
+    }
+    else
+    {
+        float p = newW / (w + newW);
+        if (random <= p)
+        {
+            sourceRS.selected = otherRS.selected;
+        
+        }
+        sourceRS.count += otherRS.count;
+        sourceRS.weightSum = w + newW;
+    }
+
+}
+void UpdateReservoir(inout ReservoirSample sourceRS, RaySample newSample, float4 seed)
+{
+    float random = saturate(FastHash(seed));
+    float w = sourceRS.weightSum;
+    float newW = ComputeLuminance(newSample.radiance);
+    if ((w + newW) == 0)
+    {
+        sourceRS.selected = newSample;
+        sourceRS.count++;
+        sourceRS.weightSum = 0;
+    }
+    else
+    {
+        float p = newW / (w + newW);
+        if (random <= p)
+        {
+            sourceRS.selected = newSample;
+        
+        }
+        sourceRS.count++;
+        sourceRS.weightSum = w + newW;
+    }
+
+}
+int _HistoryDepth;
+int _CurrendStartDepth;
+#define DefaultMetallic 0
+#define DefaultRoughness 1
+uint GetHistoryBufferIndex(int2 index, int time)
+{
+    return index.x + index.y * _ScreenWidth + time * _ScreenWidth * _ScreenHeight;
+
+}
+
+float3 GetReservoirResult(ReservoirSample rs)
+{
+    return rs.selected.radiance * (rs.eWeight);
+}
+inline ReservoirSample EmptyRS()
+{
+    ReservoirSample result;
+    result.count = 0;
+    result.weightSum = 0;
+    result.eWeight = 0;
+    result.selected.pos = float3(0, 0, 0);
+    result.selected.pdf = 0;
+    result.selected.radiance = float3(0, 0, 0);
+    result.selected.path = float3(0, 0, 0);
+    result.selected.endNormal = float3(0, 0, 0);
+    
+    return result;
+
+}
+Texture2D<float4> _NoiseTex;
+float EvaluateTargetPDF(RaySample sample, float3 pos, float3 normal)
+{
+    return EvaluateBRDFPdf(normal, normalize(pos - sample.pos), normalize(sample.path), DefaultMetallic, DefaultRoughness);
+}
+void GetGBuffer(int2 index, inout float3 pos, inout float3 normal)
+{
+    float depth = LinearEyeDepth(_DepthTexture[index].x);
+    pos = UVToWorld((float2) index / float2(_ScreenWidth, _ScreenHeight), depth);
+    normal = _NormalTexture[index].xyz;
+}
+[numthreads(8, 8, 1)]
+void RenderLocalSDFDebug(uint3 dtid : SV_DispatchThreadID, uint3 gtID : SV_GroupThreadID)
+{
+
+    uint2 pixelCoord = dtid.xy;
+    if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
+        return;
+    float depth = LinearEyeDepth(_DepthTexture[pixelCoord.xy].x);
+    float3 normal = _NormalTexture[pixelCoord.xy].xyz;
+    Ray ray = ScreenToRay((float2) pixelCoord, float2((float) _ScreenWidth, (float) _ScreenHeight), _ProjectionMatrixInverse, _ViewMatrixInverse);
+    float3 startWorldPos = UVToWorld((float2) pixelCoord / float2((float) _ScreenWidth, (float) _ScreenHeight), depth);
+    
+    float3 accumColor = float3(0, 0, 0);
+    
+    const int spp = 1;
+    uint seed = pixelCoord.x * pixelCoord.y % 100;
+    float coneAngle = 90;
+    float2 rand2 = _NoiseTex[int2(pixelCoord.x % 256, pixelCoord.y % 256)].xy;
+    ReservoirSample reservoirSample = EmptyRS();
+    float3 direction;
+    float3 color;
+    for (int i = 0; i < spp; i++)
+    {
+        ObjectData hitObj;
+        ObjectData nullObj;
+
+        float pdf;
+        //float3 direction = SampleConeDirection(normal, coneAngle, float2(FastHash(float4(seed, rand2, i + _TimeSeed)), FastHash(float4(rand2, i + _TimeSeed, pixelCoord.y * i))));
+
+        float3 f;
+        SampleBRDF(normal, -ray.direction, float3(1, 1, 1), DefaultMetallic, DefaultRoughness, FastHash(float4(seed * _TimeSeed, rand2, i + _TimeSeed)), FastHash(float4(i + _TimeSeed, rand2 * _TimeSeed, seed)), FastHash(float4(seed * i, i + rand2, _TimeSeed)), direction, f, pdf);
+        RayMarchResult hitResult = RayMarchSDFWithBVH(startWorldPos, direction, 5000.0, 128, hitObj);
+        RaySample newSample;
+        newSample.pdf = 0;
+        newSample.radiance = 0;
+        newSample.pos = 0;
+        newSample.path = 0;
+        newSample.endNormal = 0;
+        if (hitResult.hit == true)
+        {
+            float3 outAlbedo = float3(0, 0, 0);
+            float3 outNormal = float3(0, 0, 0);
+            half3 outEmissive = half3(0, 0, 0);
+            float outMetallic = 0;
+            float outSmoothness = 0;
+            half4 outRadiosityAtla = half4(0, 0, 0, 0);
+            GetSurfaceCacheData(hitObj, mul(hitObj.worldToLocalAffineMatrix, float4(hitResult.hitPosition, 1)).xyz, outAlbedo, outNormal, outEmissive, outMetallic, outSmoothness, outRadiosityAtla);
+            color = CookTorranceBRDF(normal, -ray.direction, direction, outRadiosityAtla.xyz + outEmissive * 2, DefaultMetallic.xxx, DefaultRoughness);
+            newSample.pdf = pdf;
+            newSample.radiance = color;
+            newSample.pos = hitResult.hitPosition;
+            newSample.path = hitResult.hitPosition - startWorldPos;
+            newSample.endNormal = outNormal;
+
+        }
+        else
+        {
+            newSample.pdf = pdf;
+            newSample.radiance = 0;
+
+        }
+
+
+        UpdateReservoir(reservoirSample, newSample, float4(rand2, seed, i + _TimeSeed));
+    }
+    accumColor = GetReservoirResult(reservoirSample);
+    float targetPDF = EvaluateTargetPDF(reservoirSample.selected, startWorldPos, normal);
+    reservoirSample.eWeight = reservoirSample.weightSum / ((float) max(reservoirSample.count, 1) * max(targetPDF, 0.1));
+    reservoirSample.selected.radiance = color;
+
+    _ReservoirBuffer[GetBufferIndex(pixelCoord)] = reservoirSample;
+    _TempBuffer[pixelCoord] = float4(GetReservoirResult(reservoirSample), 1);
+    //_TempBuffer[pixelCoord] = float4(direction, 1);
+    //_TemporalReservoir[GetBufferIndex(pixelCoord)] = reservoirSample;
+}
+
+
+
+
+[numthreads(8, 8, 1)]
+void TemporalReuse(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dtid.xy;
+    if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
+        return;
+    float3 currentPos;
+    float3 currentNorm;
+    GetGBuffer(pixelCoord, currentPos, currentNorm);
+    ReservoirSample currentRes = _ReservoirBuffer[GetBufferIndex(pixelCoord)];
+
+    float2 rand2 = _NoiseTex[int2(pixelCoord.x % 256, pixelCoord.y % 256)].xy;
+    for (int i = 0; i < _HistoryDepth; i++)
+    {
+        int index = (i + _CurrendStartDepth) % _HistoryDepth;
+        ReservoirSample historyRes = _HistoryBuffer[GetHistoryBufferIndex(pixelCoord, index)];
+        if (distance((historyRes.selected.pos - historyRes.selected.path), (currentRes.selected.pos - currentRes.selected.path)) < 0.1)
+        {
+            MergeReservoir(currentRes, historyRes, float4(i, rand2, index + _TimeSeed));
+        }
+
+
+    }
+
+    //_ReservoirBuffer[GetBufferIndex(pixelCoord)] = currentRes;
+    
+
+    float targetPDF = EvaluateTargetPDF(currentRes.selected, currentPos, currentNorm);
+    currentRes.eWeight = currentRes.weightSum / ((float) max(currentRes.count, 1) * max(targetPDF, 0.1));
+    _TemporalReservoir[GetBufferIndex(pixelCoord)] = currentRes;
+
+
+    _TempBuffer[pixelCoord] = float4(GetReservoirResult(currentRes), 1);
+}
+[numthreads(8, 8, 1)]
+void HistoryFeedBack(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dtid.xy;
+    if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
+        return;
+    ReservoirSample currentRes = _TemporalReservoir[GetBufferIndex(pixelCoord)];
+    const int sampleCount = 30;
+    if (currentRes.count > sampleCount)
+    {
+        int oCount = currentRes.count;
+        float scale = (float) sampleCount / (float) oCount;
+        currentRes.count = sampleCount;
+        currentRes.weightSum *= scale;
+        currentRes.eWeight *= scale;  
+
+    }
+    _HistoryBuffer[GetHistoryBufferIndex(pixelCoord, _CurrendStartDepth)] = currentRes;
+
+}
+
+[numthreads(8, 8, 1)]
+void SpatialReuse(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dtid.xy;
+    if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
+        return;
+    ReservoirSample currentRes = _TemporalReservoir[GetBufferIndex(pixelCoord)];
+    float3 currentPos;
+    float3 currentNorm;
+    GetGBuffer(pixelCoord, currentPos, currentNorm);
+    static int2 offsets[8] = { int2(-1, -1), int2(1, -1), int2(0, -1), int2(-1, 0), int2(1, 0), int2(-1, 1), int2(1, 1), int2(0, 1) };
+    for (int i = 0; i < 8; ++i)
+    {
+        int2 neighIndex = pixelCoord + offsets[i];
+        if (neighIndex.x < 0 || neighIndex.y < 0 ||
+            neighIndex.x >= _ScreenWidth || neighIndex.y >= _ScreenHeight)
+        {
+            continue;
+        }
+        ReservoirSample neighRes = _TemporalReservoir[GetBufferIndex(neighIndex)];
+        RaySample neighSample = neighRes.selected;
+        float3 neighPos;
+        float3 neighNorm;
+        GetGBuffer(neighIndex, neighPos, neighNorm);
+        float np = dot(currentRes.selected.endNormal, normalize(-currentRes.selected.path));
+        float nq = dot(currentRes.selected.endNormal, normalize(-neighRes.selected.path));
+        float rp = length(currentRes.selected.path);
+        float rq = length(neighRes.selected.path);
+        float rp2 = rp * rp;
+        float rq2 = rq * rq;
+        float jacobian = (nq * rp2) / (np * rq2);
+        if (np <= 0 || nq <= 0)
+        {
+            continue;
+        }
+        
+        float targetPDF = EvaluateTargetPDF(currentRes.selected, neighPos, neighNorm);
+        targetPDF = targetPDF / jacobian;
+        neighRes.weightSum = neighRes.eWeight * (float) neighRes.count * targetPDF;
+        MergeReservoir(currentRes, neighRes, float4(_TimeSeed * i, i, offsets[i]));
+
+    }
+    const int sampleCount = 500;
+    if (currentRes.count > sampleCount)
+    {
+        int oCount = currentRes.count;
+        float scale = (float) sampleCount / (float) oCount;
+        currentRes.count = sampleCount;
+        currentRes.weightSum *= scale;
+        currentRes.eWeight *= scale;
+
+    }
+    float targetPDF = EvaluateTargetPDF(currentRes.selected, currentPos, currentNorm);
+    currentRes.eWeight = currentRes.weightSum / ((float) max(currentRes.count, 1) * max(targetPDF, 0.1));
+
+    _ReservoirBuffer[GetBufferIndex(pixelCoord)] = currentRes;
+    
+}
+
+
+[numthreads(8, 8, 1)]
+void OutputReSTIR(uint3 dtid : SV_DispatchThreadID)
+{
+    uint2 pixelCoord = dtid.xy;
+    if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
+        return;
+    
+    ReservoirSample currentRes = _ReservoirBuffer[GetBufferIndex(pixelCoord)];
+    float3 accumColor = GetReservoirResult(currentRes);
+    if (abs(ComputeLuminance(accumColor)) > 20)
+    {
+        accumColor = 0;
+
+    }
+    _TempBuffer[pixelCoord] = float4(accumColor, 1);
+}
+
+
+
+
+
+
+[numthreads(8, 8, 1)]
+void BlitToActive(uint3 id : SV_DispatchThreadID)
+{
+
+    uint2 pixelCoord = id.xy;
+    if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
+        return;
+
+    float4 color = _TempBuffer[pixelCoord];
+
+    _ResultTarget[pixelCoord] = color;
+}
+[numthreads(8, 8, 1)]
+void GlobalVoxelTest(uint3 id : SV_DispatchThreadID)
+{
+
+    uint2 pixelCoord = id.xy;
+    Ray ray = ScreenToRay((float2) pixelCoord, float2((float) _ScreenWidth, (float) _ScreenHeight), _ProjectionMatrixInverse, _ViewMatrixInverse);
+    GlobalVoxel globalVoxel;
+    RayTraceResult hitResult = GlobalVoxelRayTrace(ray.origin, ray.direction, 10000, 100, globalVoxel);
+
+   
+    if (hitResult.hit)
+    {
+        _ResultTarget[pixelCoord] = (float4) DecodeRGBAuint(globalVoxel.AlbedoFront) + (float4) DecodeRGBAuint(globalVoxel.FinalRadiosityAtlas);
+    }
+    else
+    {
+        _ResultTarget[pixelCoord] = float4(0, 0, 0, 0);
+    }
+
+    //_ResultTarget[pixelCoord] = _VoxelSDFRT.SampleLevel(_LinearClamp, float3((float2) id.xy / float2(1920, 1920), 0.1), 0);
+    //_ResultTarget[pixelCoord] = _VoxelSDFRT.SampleLevel(_LinearClamp, GetVoxelRTUVW(_CenterPosition + float3((float2)id.xy - float2(1920, 1080) / 2, 0)/15), 0);
+}
+[numthreads(8, 8, 1)]
+void GlobalVoxelGI(uint3 id : SV_DispatchThreadID)
+{
+
+    uint2 pixelCoord = id.xy;
+    float depth = LinearEyeDepth(_DepthTexture[pixelCoord.xy].x);
+    Ray ray = ScreenToRay((float2) pixelCoord, float2((float) _ScreenWidth, (float) _ScreenHeight), _ProjectionMatrixInverse, _ViewMatrixInverse);
+    float3 startWorldPos = UVToWorld((float2) pixelCoord / float2((float) _ScreenWidth, (float) _ScreenHeight), depth);
+    
+    float3 accumColor = float3(0, 0, 0);
+    float3 normal = GetNormal(pixelCoord);
+    Ray reflectRay;
+    reflectRay.direction = reflect(ray.direction, normal);
+    //reflectRay.origin = GetNextRayStep(startWorldPos, normal, 0);
+    float minSize = _VoxelBaseDeltaSize * exp2(GetVoxelLevel(startWorldPos) + 1);
+    reflectRay.origin = startWorldPos ;
+    
+    accumColor = GlobalVoxelRadianceCalculate(reflectRay.origin, normal, _ConeAngle, _ConeCount, _ConeSteps);
+    float3 finalColor = accumColor;
+    _ResultTarget[pixelCoord] = float4(finalColor, 1.0);
+}
+[numthreads(8, 8, 1)]
+void OutputColor(uint3 id : SV_DispatchThreadID)
+{
+
+    int2 pixelCoord = id.xy;
+
+    float4 finalColor = _LumResult[pixelCoord];
+    
+    _ResultTarget[pixelCoord] = finalColor * _ActiveTexture[id.xy];
+}
+[numthreads(8, 8, 1)]
+void SSRTest(uint3 id : SV_DispatchThreadID)
+{
+
+    int2 pixelCoord = id.xy;
+    float2 uv = (float2) pixelCoord / _ScreenSize_SSR;
+    float3 normal = ScreenToNormal_SSR(uv);
+    float3 direction = ScreenToDirection_SSR(uv, _ProjectionMatrixInverse_SSR, _ViewMatrixInverse_SSR);
+    float4 color = SSRCalculate(uv, reflect(direction, normal));
+    
+    _ResultTarget[pixelCoord] = (color + 1) * _ActiveTexture[id.xy];
+}
