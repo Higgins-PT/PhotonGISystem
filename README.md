@@ -1,4 +1,4 @@
-<h2 align="center">效果展示</h2>
+<h2 align="center">Showcase</h2>
 <hr style="border: none; border-top: 1px solid #444; height: 1px; width: 100%;"/>
 
 <img width="736" height="410" alt="672922c275558a5bc9d850be78c7dcc4" src="https://github.com/user-attachments/assets/94a2979a-c04d-4adc-8494-3a4735927c41" />
@@ -6,76 +6,76 @@
 <img width="750" height="416" alt="15a1591774d9b956f383aab22845d474" src="https://github.com/user-attachments/assets/c8bb80d4-7f58-4730-9bd9-86fbedc9c48a" />
 <img width="735" height="754" alt="0a0127c03dfff3d044c1d4e86ca034c8" src="https://github.com/user-attachments/assets/2f2d974a-e754-4bfa-8146-59966a01f158" />
 
-
 ---
 
-<h2 align="center">简介</h2>
+<h2 align="center">Introduction</h2>
 <hr style="border: none; border-top: 1px solid #444; height: 1px; width: 100%;"/>
 
-本项目实现了一套 **类似 Unreal Engine Lumen** 的实时全局光照（Global Illumination, GI）系统，专为 Unity URP（Universal Render Pipeline） 定制。  
-核心思路大致是使用RadianceCache与ReSTIR，并用多种光追混合，以及降分辨率采样后超分辨率，并且使用多种降噪方式进行降噪
-默认1/4SPP，1Bounds
+This project implements a real-time Global Illumination (GI) system similar to Unreal Engine Lumen, tailored for the Unity Universal Render Pipeline (URP).  
+The core approach uses RadianceCache and ReSTIR, combines multiple ray tracing methods, performs low-resolution sampling followed by super-resolution, and applies various denoising techniques.  
+Default settings: 1/4 SPP, 1 Bound.
 
 ---
 
-<h2 align="center">Feature</h2>
+<h2 align="center">Features</h2>
 <hr style="border: none; border-top: 1px solid #444; height: 1px; width: 100%;"/>
 
 - LocalSDF  
-- 全局体素  
-- SSR  
-- SVGF  
-- WALR  
-- 可选择 OIDN  
-- 可选择 OptiX  
-- SurfaceCache  
-- ReSTIRDI  
-- ReSTIRGI  
-- 降分辨率运算  
-- 超分辨率  
-- 光源遮蔽剔除  
-- 无需烘焙  
-- 所有物体均可动态变换（改变 Mesh、改变材质、改变光源变换或参数）
+- Global Voxelization  
+- Screen Space Reflections (SSR)  
+- Spatiotemporal Variance-Guided Filtering (SVGF)  
+- Warranted Adaptive Light Reprojection (WALR)  
+- Optional Intel Open Image Denoise (OIDN)  
+- Optional NVIDIA OptiX  
+- Surface Cache  
+- ReSTIR Direct Illumination (ReSTIRDI)  
+- ReSTIR Global Illumination (ReSTIRGI)  
+- Resolution Downscaling  
+- Super-Resolution  
+- Light Occlusion Culling  
+- No Baking Required  
+- Fully Dynamic Objects (mesh changes, material changes, light transforms or parameter changes)
 
 ---
 
-<h2 align="center">使用教程</h2>
+<h2 align="center">Usage</h2>
 <hr style="border: none; border-top: 1px solid #444; height: 1px; width: 100%;"/>
 
-1. **导入包**  
-   - 将提供的 UnityPackage 导入项目，项目根目录会出现 `PhotonGISystem` 文件夹。
+1. **Import Package**  
+   - Import the provided UnityPackage into your project. A `PhotonGISystem` folder will appear in the root directory.
 
-2. **场景初始化**  
-   - 从 `PhotonGISystem/Prefabs` 中将根 Prefab（`PhotonGISystem.prefab`）拖入当前场景。
+2. **Scene Setup**  
+   - Drag the root prefab (`PhotonGISystem.prefab`) from `PhotonGISystem/Prefabs` into your scene.
 
-3. **Fix Issues 一键修复**  
-   - 选中场景中的 **PhotonGISystem** 对象，Inspector 中点击 **Fix Issues**。
+3. **Fix Issues**  
+   - Select the `PhotonGISystem` object in the scene and click **Fix Issues** in the Inspector.
 
-4. **URP 阴影设置**  
-   - 建议关闭 URP 默认阴影（Project Settings → Graphics → URP Asset → Shadows → None），  
-   - 或者使用根目录下提供的 **Photon_RPAsset**。
+4. **URP Shadow Settings**  
+   - It is recommended to disable URP shadows (Project Settings → Graphics → URP Asset → Shadows → None),  
+   - or use the provided `Photon_RPAsset` in the root directory.
 
-5. **开启/关闭 GI**  
-   - 选中 **PhotonGISystem**，在 **DebugManager** 面板勾选 **EnableDebug** 控制实时 GI。
+5. **Enable/Disable GI**  
+   - Select `PhotonGISystem` and toggle **EnableDebug** in the DebugManager to switch real-time GI on or off.
 
-6. **分辨率设置**  
-   - 在 **DebugManager** 的 **Resolution** 下拉项中选择降分辨率级别（如 1/2、1/4、1/8）。
+6. **Resolution Settings**  
+   - In the DebugManager, select a downscaling factor under **Resolution** (e.g., 1/2, 1/4, 1/8).
 
-7. **AI 降噪**  
-   - 选中场景中的 **FilterManager**，勾选 **Enable Advance Denoiser**。  
-   - 前提需安装 CUDA 与 OptiX；若项目因未安装无法打开，可先以 Safe Mode 启动并关闭此选项。
+7. **AI Denoising**  
+   - Select the `FilterManager` object and check **Enable Advance Denoiser**.  
+   - Requires CUDA and OptiX installed. If the project fails to open without these, start in Safe Mode to disable this option.
 
-8. **启用光追计算**  
-   - **物体**：为需参与光追的对象添加组件 **PhotonObject**。  
-   - **光源**：为需参与光追的 Light 添加组件 **LightReporter**。
+8. **Enable Ray Tracing Calculations**  
+   - **Objects**: Add the **PhotonObject** component to meshes or GameObjects that should participate in ray tracing sampling.  
+   - **Lights**: Add the **LightReporter** component to Lights that should be included in ray tracing.
 
-> **注意**：许多调节参数为废案，实际效果可能不明显或没有。  
+> **Note**: Many parameters are experimental and may have no noticeable effect. If issues arise, revert to defaults or contact the developer.
 
 ---
-<h2 align="center">兼容版本</h2>
+
+<h2 align="center">Compatibility</h2>
 <hr style="border: none; border-top: 1px solid #444; height: 1px; width: 100%;"/>
 
-- **Unity**：6.0 及以上  
-- **Render Pipeline**：URP 12.0 及以上  
-- **平台支持**：Windows, macOS, Linux  
-- **硬件需求**：GTX 1660 及以上（最低画质）  
+- **Unity**: 6.0 and above  
+- **Render Pipeline**: URP 12.0 and above  
+- **Platforms**: Windows, macOS, Linux  
+- **Hardware Requirements**: GTX 1660 or higher (minimum quality)  
