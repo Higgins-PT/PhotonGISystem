@@ -309,7 +309,7 @@ namespace PhotonSystem
 
         public void RadainceFeedback(RadianceControl radianceControl, PhotonRenderingData photonRenderingData);
     }
-    public class RadianceControl
+    public partial class RadianceControl
     {
         public struct RadianceData
         {
@@ -623,7 +623,7 @@ namespace PhotonSystem
                 FilterManager.Instance.ApplyAtrousFilter(photonRenderingData, radianceResult, null, "_Diffuse", true, FilterManager.FO.AtrousIterations(1));
                 ExtendIDRT(photonRenderingData, radianceResult, indirectExtendRT);
             }*/
-            FilterManager.Instance.ApplySVGF(photonRenderingData, radianceResult, null, "_Diffuse", FilterManager.FO.AtrousIterations(5), FilterManager.FO.AlphaColor(0.1f));
+            FilterManager.Instance.ApplySVGF(photonRenderingData, radianceResult, null, "_Diffuse", FilterManager.FO.AtrousIterations(4), FilterManager.FO.AlphaColor(0.3f));
             FilterManager.Instance.ApplyAtrousFilter(photonRenderingData, radianceResult, null, "_Diffuse", true, FilterManager.FO.AtrousIterations(1));
             ExtendIDRT(photonRenderingData, radianceResult, indirectExtendRT);
 
@@ -1353,6 +1353,9 @@ namespace PhotonSystem
 
 
         }
+
+
+
     }
 
 

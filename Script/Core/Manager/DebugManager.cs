@@ -28,7 +28,8 @@ namespace PhotonSystem
             GlobalVoxel,
             GlobalVoxelGI,
             TestFilter,
-            SSRTest
+            SSRTest,
+            OfflineRenderer
         }
         public GameObject debugObject;
         public bool enableSceneViewCameraGI = true;
@@ -299,6 +300,11 @@ namespace PhotonSystem
                         SSRTestRendering(photonRenderingData);
                         break;
                     }
+                case DebugType.OfflineRenderer:
+                    {
+                        OfflineRendering(photonRenderingData);
+                        break;
+                    }
             }
 
 
@@ -496,8 +502,8 @@ namespace PhotonSystem
             SetScreenCSData(photonRenderingData.targetRT, photonRenderingData.normalRT, photonRenderingData.depthRT, photonRenderingData.activeRT, tempRT, photonRenderingData.cmd, kernel_OutputReSTIR);
             CommandBufferHelper.DispatchCompute_RT(photonRenderingData.cmd, photonRendererCS, photonRenderingData.targetRT, kernel_OutputReSTIR, 8);
             photonRenderingData.cmd.EndSample("ReSTIR");
-            FilterManager.Instance.ApplySVGF(photonRenderingData, tempRT, null, "_Test", FilterManager.FO.AtrousIterations(5), FilterManager.FO.AlphaColor(0.1f));
-
+            //FilterManager.Instance.ApplySVGF(photonRenderingData, tempRT, null, "_Test", FilterManager.FO.AtrousIterations(5), FilterManager.FO.AlphaColor(0.3f));
+            //FilterManager.Instance.ApplyWALR(photonRenderingData, tempRT, null, FilterManager.FO.AtrousIterations(3));
             //FilterManager.Instance.ApplyDenoiser(photonRenderingData, tempRT, "_Test");
             SetScreenCSData(photonRenderingData.targetRT, photonRenderingData.normalRT, photonRenderingData.depthRT, photonRenderingData.activeRT, tempRT, photonRenderingData.cmd, m_BlitToActive);
             photonRenderingData.cmd.DispatchCompute(photonRendererCS, m_BlitToActive, Mathf.CeilToInt((float)photonRenderingData.targetRT.width / threadGroupSize), Mathf.CeilToInt((float)photonRenderingData.targetRT.height / threadGroupSize), 1);
@@ -508,6 +514,18 @@ namespace PhotonSystem
             radianceControl.SetRadianceFeatures(HZBManager.Instance, LocalSDFManager.Instance, GlobalVoxelManager.Instance);
         }
         public void RadianceRendering(PhotonRenderingData photonRenderingData)
+        {
+            if (!enableDebug || !initFinish) return;
+            RadianceControl radianceControl = RadianceManager.Instance.GetRadianceControl(photonRenderingData.camera);
+            TraceQueueSet(radianceControl);
+            radianceControl.ExecuteRadianceCascades(photonRenderingData);
+            WorldProbesDebug(photonRenderingData);
+
+
+            //RadianceManager.Instance.RadianceCascadesCaculate(photonRenderingData);
+
+        }
+        public void OfflineRendering(PhotonRenderingData photonRenderingData)
         {
             if (!enableDebug || !initFinish) return;
             RadianceControl radianceControl = RadianceManager.Instance.GetRadianceControl(photonRenderingData.camera);

@@ -98,7 +98,7 @@ float3 CookTorranceBRDF(
     float G = SmithG1_GGX(NdotV, alpha) * SmithG1_GGX(NdotL, alpha);
 
     float3 spec = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
-    float3 diff = ((1.0 - metallicColor.xyz) * baseColor / PI);
+    float3 diff = ((1.0 - metallicColor.xyz) * baseColor / PI) * NdotL;
 
     return (diff + spec);
 }

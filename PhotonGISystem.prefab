@@ -411,6 +411,7 @@ MonoBehaviour:
   enableDebug: 1
   debugType: 1
   resolution: 4
+  indirectResolution: 4
   specularResolution: 4
   photonRendererCS: {fileID: 7200000, guid: 7c1f7c5dd0e2c9d48a6cdcffe3ce3db3, type: 3}
   debugCS: {fileID: 7200000, guid: d05e8ec6404c2c347ba3d1bb701455f8, type: 3}
@@ -418,7 +419,7 @@ MonoBehaviour:
   spp: 1
   maxBounces: 1
   coneAngle: 0
-  enableDebugPlane: 1
+  enableDebugPlane: 0
   debugPlane: {fileID: 2627560747958157054}
   debugText: {fileID: 5538832971611528061}
   surfaceCacheDebug: 0
@@ -558,11 +559,12 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c5ed75da36f281c4bbcea6b48791ca61, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  gizmosDebugAncestors: 0
   gizmosDebugAlways: 0
   leafFaceAlpha: {r: 1, g: 1, b: 1, a: 0.2}
   drawInternalFaces: 0
-  bvhCount: 49
-  bvhDepth: 3
+  bvhCount: 63
+  bvhDepth: 4
 --- !u!1 &6662617918683873336
 GameObject:
   m_ObjectHideFlags: 0
@@ -607,6 +609,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: aa552b05c0b7ee14aa7f685e98a059df, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  feedbackResolution: 4
   maxRayTracingDistance: 10000
   ssrEnableDistance: 4233
   localSDFEnableDistance: 7854
@@ -614,13 +617,14 @@ MonoBehaviour:
   worldProbeEnableDistance: 100
   probeLerpRange: 200
   worldPorbeSampleCount: 16
-  indirectIlluminationIntensity: 2
+  indirectIlluminationIntensity: 1
+  localSDFGetIlluminationIntensity: 1
+  emissionIntensity: 2
   lightIntensity: 0.3
   lightCullDistance: 2000
   lightGlobalIntensity: 5
   lightDataRefreshCameraDistance: 10
   refreshLightData: 0
-  historyCount: 8
   resolution: 2
   radianceCompute: {fileID: 7200000, guid: cd2c9117777996947ad7469f346c9eab, type: 3}
   emissionShader: {fileID: 4800000, guid: 9c45a5b176dee2847b5903be34d4078d, type: 3}
@@ -628,7 +632,7 @@ MonoBehaviour:
   albedoShader: {fileID: 4800000, guid: 11831a19f82c0054d946761766c87407, type: 3}
   shadowShader: {fileID: 4800000, guid: 2b39384a5e05d154db3ce406212fd3b4, type: 3}
   shadowMat: {fileID: 0}
-  environmentLightIntensity: 1
+  environmentLightIntensity: 5
   cubeResolution: 256
   cubeContinuousUpdate: 0
   noiseTex: {fileID: 2800000, guid: 0013f95fc4fca1147973c486c1348991, type: 2}
@@ -651,7 +655,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!224 &2627560747958157054
 RectTransform:
   m_ObjectHideFlags: 0
@@ -934,6 +938,16 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   surfaceCacheDecay: 1
   allObjects:
+  - {fileID: 0}
+  - {fileID: 0}
+  - {fileID: 0}
+  - {fileID: 0}
+  - {fileID: 0}
+  - {fileID: 0}
+  - {fileID: 0}
+  - {fileID: 0}
+  - {fileID: 0}
+  - {fileID: 0}
   - {fileID: 0}
   - {fileID: 0}
   - {fileID: 0}
@@ -1304,7 +1318,7 @@ MonoBehaviour:
   m_text: 'CullLights: 10
 
 
-    FPS: 48.8'
+    FPS: 9.8'
   m_isRightToLeft: 0
   m_fontAsset: {fileID: 11400000, guid: 8f586378b4e144a9851e7b34d9b748ee, type: 2}
   m_sharedMaterial: {fileID: 2180264, guid: 8f586378b4e144a9851e7b34d9b748ee, type: 2}

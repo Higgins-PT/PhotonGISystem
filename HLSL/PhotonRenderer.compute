@@ -173,11 +173,35 @@ void MergeReservoir(inout ReservoirSample sourceRS, ReservoirSample otherRS, flo
     }
 
 }
+
 void UpdateReservoir(inout ReservoirSample sourceRS, RaySample newSample, float4 seed)
 {
     float random = saturate(FastHash(seed));
     float w = sourceRS.weightSum;
     float newW = ComputeLuminance(newSample.radiance);
+    if ((w + newW) == 0)
+    {
+        sourceRS.selected = newSample;
+        sourceRS.count++;
+        sourceRS.weightSum = 0;
+    }
+    else
+    {
+        float p = newW / (w + newW);
+        if (random <= p)
+        {
+            sourceRS.selected = newSample;
+        
+        }
+        sourceRS.count++;
+        sourceRS.weightSum = w + newW;
+    }
+
+}
+void UpdateReservoir(inout ReservoirSample sourceRS, RaySample newSample, float newW, float4 seed)
+{
+    float random = saturate(FastHash(seed));
+    float w = sourceRS.weightSum;
     if ((w + newW) == 0)
     {
         sourceRS.selected = newSample;
@@ -209,7 +233,7 @@ uint GetHistoryBufferIndex(int2 index, int time)
 
 float3 GetReservoirResult(ReservoirSample rs)
 {
-    return rs.selected.radiance * (rs.eWeight);
+    return normalize(rs.selected.radiance) * (rs.eWeight);
 }
 inline ReservoirSample EmptyRS()
 {
@@ -268,7 +292,7 @@ void RenderLocalSDFDebug(uint3 dtid : SV_DispatchThreadID, uint3 gtID : SV_Group
 
         float3 f;
         SampleBRDF(normal, -ray.direction, float3(1, 1, 1), DefaultMetallic, DefaultRoughness, FastHash(float4(seed * _TimeSeed, rand2, i + _TimeSeed)), FastHash(float4(i + _TimeSeed, rand2 * _TimeSeed, seed)), FastHash(float4(seed * i, i + rand2, _TimeSeed)), direction, f, pdf);
-        RayMarchResult hitResult = RayMarchSDFWithBVH(startWorldPos, direction, 5000.0, 128, hitObj);
+        RayMarchResult hitResult = RayMarchSDFWithBVH(startWorldPos + normal * 0.01, direction, 5000.0, 128, hitObj);
         RaySample newSample;
         newSample.pdf = 0;
         newSample.radiance = 0;
@@ -284,7 +308,8 @@ void RenderLocalSDFDebug(uint3 dtid : SV_DispatchThreadID, uint3 gtID : SV_Group
             float outSmoothness = 0;
             half4 outRadiosityAtla = half4(0, 0, 0, 0);
             GetSurfaceCacheData(hitObj, mul(hitObj.worldToLocalAffineMatrix, float4(hitResult.hitPosition, 1)).xyz, outAlbedo, outNormal, outEmissive, outMetallic, outSmoothness, outRadiosityAtla);
-            color = CookTorranceBRDF(normal, -ray.direction, direction, outRadiosityAtla.xyz + outEmissive * 2, DefaultMetallic.xxx, DefaultRoughness);
+            color = CookTorranceBRDF(normal, -ray.direction, direction, outRadiosityAtla.xyz + outEmissive, DefaultMetallic.xxx, DefaultRoughness);
+            //color = CookTorranceBRDF(normal, -ray.direction, direction, outEmissive, DefaultMetallic.xxx, DefaultRoughness);
             newSample.pdf = pdf;
             newSample.radiance = color;
             newSample.pos = hitResult.hitPosition;
@@ -296,7 +321,7 @@ void RenderLocalSDFDebug(uint3 dtid : SV_DispatchThreadID, uint3 gtID : SV_Group
         {
             newSample.pdf = pdf;
             newSample.radiance = 0;
-
+            newSample.endNormal = -direction;
         }
 
 
@@ -327,20 +352,16 @@ void TemporalReuse(uint3 dtid : SV_DispatchThreadID)
     GetGBuffer(pixelCoord, currentPos, currentNorm);
     ReservoirSample currentRes = _ReservoirBuffer[GetBufferIndex(pixelCoord)];
 
-    float2 rand2 = _NoiseTex[int2(pixelCoord.x % 256, pixelCoord.y % 256)].xy;
+    float2 rand2 = _NoiseTex[int2(pixelCoord.x % 255, pixelCoord.y % 255)].xy;
     for (int i = 0; i < _HistoryDepth; i++)
     {
         int index = (i + _CurrendStartDepth) % _HistoryDepth;
         ReservoirSample historyRes = _HistoryBuffer[GetHistoryBufferIndex(pixelCoord, index)];
-        if (distance((historyRes.selected.pos - historyRes.selected.path), (currentRes.selected.pos - currentRes.selected.path)) < 0.1)
-        {
-            MergeReservoir(currentRes, historyRes, float4(i, rand2, index + _TimeSeed));
-        }
-
-
+        float targetPDF = EvaluateTargetPDF(currentRes.selected, currentPos, currentNorm);
+        float w = targetPDF / currentRes.selected.pdf;
+        MergeReservoir(currentRes, historyRes, float4(i, rand2, index + _TimeSeed));
     }
-
-    //_ReservoirBuffer[GetBufferIndex(pixelCoord)] = currentRes;
+   
     
 
     float targetPDF = EvaluateTargetPDF(currentRes.selected, currentPos, currentNorm);
@@ -357,7 +378,7 @@ void HistoryFeedBack(uint3 dtid : SV_DispatchThreadID)
     if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
         return;
     ReservoirSample currentRes = _TemporalReservoir[GetBufferIndex(pixelCoord)];
-    const int sampleCount = 30;
+    const int sampleCount = 5;
     if (currentRes.count > sampleCount)
     {
         int oCount = currentRes.count;
@@ -384,7 +405,7 @@ void SpatialReuse(uint3 dtid : SV_DispatchThreadID)
     static int2 offsets[8] = { int2(-1, -1), int2(1, -1), int2(0, -1), int2(-1, 0), int2(1, 0), int2(-1, 1), int2(1, 1), int2(0, 1) };
     for (int i = 0; i < 8; ++i)
     {
-        int2 neighIndex = pixelCoord + offsets[i];
+        int2 neighIndex = (int2)pixelCoord + offsets[i];
         if (neighIndex.x < 0 || neighIndex.y < 0 ||
             neighIndex.x >= _ScreenWidth || neighIndex.y >= _ScreenHeight)
         {
@@ -408,9 +429,9 @@ void SpatialReuse(uint3 dtid : SV_DispatchThreadID)
         }
         
         float targetPDF = EvaluateTargetPDF(currentRes.selected, neighPos, neighNorm);
-        targetPDF = targetPDF / jacobian;
+        //targetPDF = targetPDF * jacobian;
         neighRes.weightSum = neighRes.eWeight * (float) neighRes.count * targetPDF;
-        MergeReservoir(currentRes, neighRes, float4(_TimeSeed * i, i, offsets[i]));
+        MergeReservoir(currentRes, neighRes, float4(_TimeSeed * (i + 1), i, offsets[i]));
 
     }
     const int sampleCount = 500;
@@ -461,8 +482,8 @@ void BlitToActive(uint3 id : SV_DispatchThreadID)
     if (pixelCoord.x >= (uint) _ScreenWidth || pixelCoord.y >= (uint) _ScreenHeight)
         return;
 
+    //float4 color = _TempBuffer[pixelCoord] * _ActiveTexture[id.xy];
     float4 color = _TempBuffer[pixelCoord];
-
     _ResultTarget[pixelCoord] = color;
 }
 [numthreads(8, 8, 1)]
